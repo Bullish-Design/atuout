@@ -8,9 +8,15 @@
   packages = [
     pkgs.git
     pkgs.uv
-    pkgs.asciinema
     pkgs.jq
     ];
+
+  # grpcio ships a C extension that dlopen's libstdc++ at import time; expose it
+  # (and zlib, needed by grpcio-tools' protoc) so imports work in the venv.
+  env.LD_LIBRARY_PATH = lib.makeLibraryPath [
+    pkgs.stdenv.cc.cc.lib
+    pkgs.zlib
+  ];
 
   # https://devenv.sh/languages/
   languages = {
@@ -36,6 +42,10 @@
   enterTest = ''
     echo "Running tests"
     git --version | grep --color=auto "${pkgs.git.version}"
+    uv sync --extra dev
+    uv run ruff check src tests
+    uv run mypy
+    uv run pytest
   '';
 
   # See full reference at https://devenv.sh/reference/options/
