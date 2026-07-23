@@ -74,6 +74,12 @@ no_implicit_optional = true
 [[tool.mypy.overrides]]
 module = ["atuout._proto.*"]
 ignore_errors = true
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+[[tool.mypy.overrides]]
+module = ["grpc"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 120
