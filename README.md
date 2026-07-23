@@ -1,47 +1,54 @@
 # Atuout
 
-Shell session recorder that captures command input/output via [asciinema](https://asciinema.org/), linked to [Atuin](https://atuin.sh/) history.
+Durable archiver for [Atuin](https://atuin.sh/)'s native command-output captures. Atuin's
+`atuin pty-proxy` captures each command's output (via OSC 133) into an ephemeral, in-memory
+daemon buffer; atuout **harvests** those captures over gRPC into its own SQLite store, keyed by
+`ATUIN_HISTORY_ID`, so they survive after Atuin's ring buffer evicts them.
+
+## Requirements
+
+atuout **requires** your shell to run inside `atuin pty-proxy` — there is no fallback. Atuin must
+be built with the `daemon` + `pty-proxy` features and have `daemon.enabled = true`.
 
 ## Quickstart
 
 ```bash
-# Install
 pip install -e ".[dev]"
-
-# Record a command
-atuout record "echo hello"
-
-# Record with an Atuin history ID
-atuout record --atuin-id abc123 "ls -la"
-
-# List recordings
-atuout list
-
-# Show output from a recording
-atuout show ~/.local/share/atuout/recordings/1700000000.cast
 ```
 
-## Zsh Integration
-
-Add to your `.zshrc`:
+Add to your `.zshrc`, in this order (pty-proxy first — it wraps the shell):
 
 ```zsh
-eval "$(atuout init-zsh)"
+eval "$(atuin pty-proxy init zsh)"   # must come first
+eval "$(atuout init-zsh)"            # harvests captures via the daemon
 ```
 
-This installs `preexec`/`precmd` hooks that automatically record every command you run using asciinema. If Atuin is active, each recording is linked to its Atuin history ID.
+`atuout init-zsh` installs `preexec`/`precmd` hooks that fire a detached `atuout harvest
+<history_id>` after each command (never blocking your prompt) and start a background reconciler
+that backfills any capture the fast path misses.
+
+## CLI
+
+```bash
+atuout list                 # list stored recordings (newest first)
+atuout show <atuin_id>      # show a stored recording by Atuin history id
+atuout status               # daemon/reconciler/store health
+atuout reconcile status     # background reconciler state (also: ensure/stop/restart)
+atuout harvest <atuin_id>   # fetch+store one capture (normally called by the hook)
+```
 
 ## Python API
 
 ```python
-from atuout import record_command
+from atuout import store
+from atuout.recording import Recording
 
-rec = record_command("ls -la", atuin_id="abc123")
+conn = store.connect()
+rec = store.get_recording(conn, "abc123")   # -> Recording | None
 
 rec.success       # True if exit code was 0
-rec.exit_code     # Exit code of the recorded command
-rec.output        # Full captured stdout
-rec.output_lines  # stdout split into lines
+rec.exit_code     # Exit code of the command
+rec.output        # Full captured output
+rec.output_lines  # Output split into lines
 rec.atuin_id      # Linked Atuin history ID
-rec.duration      # Recording duration in seconds
 ```

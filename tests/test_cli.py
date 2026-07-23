@@ -64,7 +64,10 @@ class TestCLIInitZsh:
     def test_init_zsh_prints_hook(self, capsys: pytest.CaptureFixture[str]) -> None:
         ret = main(["init-zsh"])
         assert ret == 0
-        assert "add-zsh-hook" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "add-zsh-hook" in out
+        assert "ATUIN_PTY_PROXY_ACTIVE" in out
+        assert "atuout harvest" in out
 
 
 class TestCLIStatus:
