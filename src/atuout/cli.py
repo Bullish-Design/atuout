@@ -24,6 +24,19 @@ def _zsh_hook_text() -> str | None:
     return None
 
 
+def cmd_harvest(args: argparse.Namespace) -> int:
+    from atuout.harvest import harvest
+
+    harvest(
+        args.atuin_id,
+        command=args.command,
+        exit_code=args.exit_code,
+        db_path=Path(args.db) if args.db else None,
+    )
+    # Always succeed: this runs detached from the shell hook and must never disturb it.
+    return 0
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     from atuout import store
 
@@ -68,6 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--db", default=None, help="Override the SQLite database path.")
     sub = parser.add_subparsers(dest="subcommand")
+
+    p_harvest = sub.add_parser("harvest", help="Fetch and store a capture by Atuin history id.")
+    p_harvest.add_argument("atuin_id", help="Atuin history id.")
+    p_harvest.add_argument("--command", default=None, help="Command text (from the shell hook).")
+    p_harvest.add_argument("--exit-code", type=int, default=None, help="Command exit code.")
+    p_harvest.set_defaults(func=cmd_harvest)
 
     p_ls = sub.add_parser("list", help="List stored recordings.")
     p_ls.add_argument("--limit", type=int, default=None, help="Max recordings to show.")
