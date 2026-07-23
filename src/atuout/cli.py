@@ -7,24 +7,28 @@ import sys
 from pathlib import Path
 
 
-def cmd_record(args: argparse.Namespace) -> int:
-    from atuout.recorder import record_command
+def _zsh_hook_text() -> str | None:
+    """Locate the zsh hook, preferring installed package data over the source tree."""
+    import importlib.resources as resources
 
-    rec = record_command(
-        args.command,
-        atuin_id=args.atuin_id,
-        data_dir=Path(args.data_dir) if args.data_dir else None,
-    )
-    print(rec)
-    if not rec.success:
-        return 1
-    return 0
+    try:
+        res = resources.files("atuout").joinpath("shell/atuout.zsh")
+        if res.is_file():
+            return res.read_text()
+    except (FileNotFoundError, TypeError, ModuleNotFoundError):
+        pass
+
+    source_path = Path(__file__).resolve().parent.parent.parent / "shell" / "atuout.zsh"
+    if source_path.exists():
+        return source_path.read_text()
+    return None
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    from atuout.recorder import list_recordings
+    from atuout import store
 
-    recs = list_recordings(data_dir=Path(args.data_dir) if args.data_dir else None)
+    conn = store.connect(Path(args.db) if args.db else None)
+    recs = store.list_recordings(conn, limit=args.limit)
     if not recs:
         print("No recordings found.")
         return 0
@@ -34,13 +38,13 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 
 def cmd_show(args: argparse.Namespace) -> int:
-    from atuout.recording import Recording
+    from atuout import store
 
-    path = Path(args.cast_file)
-    if not path.exists():
-        print(f"File not found: {path}", file=sys.stderr)
+    conn = store.connect(Path(args.db) if args.db else None)
+    rec = store.get_recording(conn, args.atuin_id)
+    if rec is None:
+        print(f"No recording for atuin id: {args.atuin_id}", file=sys.stderr)
         return 1
-    rec = Recording(cast_path=path, command="<loaded>")
     print(rec)
     print("--- output ---")
     print(rec.output)
@@ -49,43 +53,30 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_init_zsh(_args: argparse.Namespace) -> int:
     """Print the zsh hook script to stdout for eval."""
-    hook_path = Path(__file__).resolve().parent.parent.parent.parent / "shell" / "atuout.zsh"
-    if not hook_path.exists():
-        # Fallback: try installed location
-        import importlib.resources as resources
-
-        try:
-            hook_text = resources.files("atuout").joinpath("shell/atuout.zsh").read_text()
-        except (FileNotFoundError, TypeError):
-            print(f"# atuout: zsh hook not found (looked at {hook_path})", file=sys.stderr)
-            return 1
-    else:
-        hook_text = hook_path.read_text()
+    hook_text = _zsh_hook_text()
+    if hook_text is None:
+        print("# atuout: zsh hook not found", file=sys.stderr)
+        return 1
     print(hook_text)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="atuout", description="Shell session recorder powered by asciinema.")
-    parser.add_argument("--data-dir", default=None, help="Override recording storage directory.")
+    parser = argparse.ArgumentParser(
+        prog="atuout",
+        description="Harvester for Atuin's native command-output captures.",
+    )
+    parser.add_argument("--db", default=None, help="Override the SQLite database path.")
     sub = parser.add_subparsers(dest="subcommand")
 
-    # record
-    p_rec = sub.add_parser("record", help="Record a single command.")
-    p_rec.add_argument("command", help="Command to record.")
-    p_rec.add_argument("--atuin-id", default=None, help="Atuin history ID to link.")
-    p_rec.set_defaults(func=cmd_record)
-
-    # list
     p_ls = sub.add_parser("list", help="List stored recordings.")
+    p_ls.add_argument("--limit", type=int, default=None, help="Max recordings to show.")
     p_ls.set_defaults(func=cmd_list)
 
-    # show
-    p_show = sub.add_parser("show", help="Show output from a .cast file.")
-    p_show.add_argument("cast_file", help="Path to a .cast file.")
+    p_show = sub.add_parser("show", help="Show a stored recording by Atuin history id.")
+    p_show.add_argument("atuin_id", help="Atuin history id.")
     p_show.set_defaults(func=cmd_show)
 
-    # init-zsh
     p_init = sub.add_parser("init-zsh", help="Print the zsh hook for eval.")
     p_init.set_defaults(func=cmd_init_zsh)
 
@@ -98,7 +89,8 @@ def main(argv: list[str] | None = None) -> int:
     if not hasattr(args, "func"):
         parser.print_help()
         return 0
-    return args.func(args)
+    exit_code: int = args.func(args)
+    return exit_code
 
 
 if __name__ == "__main__":

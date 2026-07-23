@@ -61,7 +61,9 @@ omit = ["src/atuout/_proto/*"]
 
 [tool.mypy]
 python_version = "3.13"
-packages = ["src/atuout"]
+mypy_path = "src"
+packages = ["atuout"]
+exclude = ["src/atuout/_proto/"]
 strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true

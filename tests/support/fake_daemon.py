@@ -48,7 +48,7 @@ class _SemanticServicer(semantic_pb2_grpc.SemanticServicer):
 
 
 class _HistoryServicer(history_pb2_grpc.HistoryServicer):
-    def __init__(self, events: "queue.Queue[history_pb2.TailHistoryReply | None]") -> None:
+    def __init__(self, events: queue.Queue[history_pb2.TailHistoryReply | None]) -> None:
         self._events = events
 
     def TailHistory(self, request, context):  # noqa: N802 (grpc naming)
@@ -86,7 +86,7 @@ class FakeDaemon:
         self._server.stop(grace=0).wait()
         Path(self._socket_path).unlink(missing_ok=True)
 
-    def __enter__(self) -> "FakeDaemon":
+    def __enter__(self) -> FakeDaemon:
         self.start()
         return self
 

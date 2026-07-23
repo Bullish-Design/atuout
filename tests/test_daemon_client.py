@@ -17,7 +17,7 @@ def test_command_output_found(fake_daemon: FakeDaemon) -> None:
     assert reply.found is True
     assert reply.output == "hello\nworld\n"
     assert reply.total_lines == 2
-    assert reply.total_bytes == len("hello\nworld\n".encode())
+    assert reply.total_bytes == len(b"hello\nworld\n")
     assert [line.content for line in reply.lines] == ["hello", "world"]
 
 

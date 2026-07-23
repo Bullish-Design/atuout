@@ -1,145 +1,64 @@
-"""Tests for the Recording wrapper."""
-
 from __future__ import annotations
 
-import json
-import textwrap
-from pathlib import Path
-
-import pytest
-
+from atuout import store
+from atuout._proto import semantic_pb2
 from atuout.recording import Recording
 
 
-@pytest.fixture()
-def cast_file(tmp_path: Path) -> Path:
-    """Create a minimal asciicast v2 file."""
-    header = {
-        "version": 2,
-        "width": 80,
-        "height": 24,
-        "timestamp": 1700000000,
-        "duration": 1.5,
-        "env": {"SHELL": "/bin/zsh", "exit_code": "0"},
-        "command": "echo hello",
-    }
-    events = [
-        [0.1, "o", "hello\r\n"],
-        [0.2, "o", "$ "],
-    ]
-    p = tmp_path / "test.cast"
-    lines = [json.dumps(header)] + [json.dumps(e) for e in events]
-    p.write_text("\n".join(lines) + "\n")
-    return p
+def test_from_reply_populates_fields() -> None:
+    reply = semantic_pb2.CommandOutputReply(
+        found=True, output="a\nb\n", total_bytes=4, total_lines=2
+    )
+    rec = Recording.from_reply(reply, atuin_id="id1", command="ls", exit_code=0)
+    assert rec.atuin_id == "id1"
+    assert rec.command == "ls"
+    assert rec.output == "a\nb\n"
+    assert rec.output_lines == ["a", "b"]
+    assert rec.total_bytes == 4
+    assert rec.total_lines == 2
+    assert rec.success is True
 
 
-@pytest.fixture()
-def failed_cast_file(tmp_path: Path) -> Path:
-    header = {
-        "version": 2,
-        "width": 80,
-        "height": 24,
-        "timestamp": 1700000000,
-        "duration": 0.5,
-        "env": {"SHELL": "/bin/zsh", "exit_code": "1"},
-        "command": "false",
-    }
-    events = [
-        [0.1, "o", ""],
-    ]
-    p = tmp_path / "fail.cast"
-    lines = [json.dumps(header)] + [json.dumps(e) for e in events]
-    p.write_text("\n".join(lines) + "\n")
-    return p
+def test_from_reply_defaults_unknown_command() -> None:
+    reply = semantic_pb2.CommandOutputReply(found=True, output="")
+    rec = Recording.from_reply(reply, atuin_id="id1")
+    assert rec.command == "<unknown>"
 
 
-class TestRecordingParsing:
-    def test_header(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello")
-        assert rec.header["version"] == 2
-        assert rec.header["width"] == 80
-
-    def test_events(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello")
-        assert len(rec.events) == 2
-        assert rec.events[0] == (0.1, "o", "hello\r\n")
-
-    def test_output(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello")
-        assert "hello" in rec.output
-
-    def test_output_lines(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello")
-        lines = rec.output_lines
-        assert any("hello" in l for l in lines)
-
-    def test_duration(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello")
-        assert rec.duration == 1.5
+def test_success_semantics() -> None:
+    reply = semantic_pb2.CommandOutputReply(found=True, output="")
+    assert Recording.from_reply(reply, atuin_id="x", exit_code=1).success is False
+    assert Recording.from_reply(reply, atuin_id="x", exit_code=None).success is False
+    assert Recording.from_reply(reply, atuin_id="x", exit_code=0).success is True
 
 
-class TestRecordingSuccess:
-    def test_success_from_header(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello")
-        assert rec.exit_code == 0
-        assert rec.success is True
-
-    def test_failure_from_header(self, failed_cast_file: Path) -> None:
-        rec = Recording(cast_path=failed_cast_file, command="false")
-        assert rec.exit_code == 1
-        assert rec.success is False
-
-    def test_success_fallback_to_recorder(self, tmp_path: Path) -> None:
-        # Cast with no exit_code in header
-        header = {"version": 2, "width": 80, "height": 24}
-        p = tmp_path / "nocode.cast"
-        p.write_text(json.dumps(header) + "\n")
-        rec = Recording(cast_path=p, command="ls", recorder_exit_code=0)
-        assert rec.exit_code is None
-        assert rec.success is True
-
-    def test_failure_fallback_to_recorder(self, tmp_path: Path) -> None:
-        header = {"version": 2, "width": 80, "height": 24}
-        p = tmp_path / "nocode.cast"
-        p.write_text(json.dumps(header) + "\n")
-        rec = Recording(cast_path=p, command="bad", recorder_exit_code=1)
-        assert rec.success is False
+def test_from_row(db_file) -> None:
+    conn = store.connect(db_file)
+    store.upsert_recording(
+        conn,
+        atuin_id="rid",
+        command="pwd",
+        output="/home\n",
+        exit_code=2,
+        total_bytes=6,
+        total_lines=1,
+        captured_at_ms=123,
+        source="reconciler",
+    )
+    rec = store.get_recording(conn, "rid")
+    assert rec is not None
+    assert rec.command == "pwd"
+    assert rec.exit_code == 2
+    assert rec.source == "reconciler"
+    assert rec.success is False
 
 
-class TestRecordingAtuin:
-    def test_atuin_id_stored(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello", atuin_id="abc123")
-        assert rec.atuin_id == "abc123"
-
-    def test_atuin_id_none(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello")
-        assert rec.atuin_id is None
+def test_str() -> None:
+    reply = semantic_pb2.CommandOutputReply(found=True, output="")
+    rec = Recording.from_reply(reply, atuin_id="id1", command="ls", exit_code=0)
+    assert str(rec) == "Recording(ok atuin=id1 'ls')"
 
 
-class TestRecordingStr:
-    def test_str_success(self, cast_file: Path) -> None:
-        rec = Recording(cast_path=cast_file, command="echo hello", atuin_id="abc")
-        s = str(rec)
-        assert "ok" in s
-        assert "abc" in s
-        assert "echo hello" in s
-
-    def test_str_failure(self, failed_cast_file: Path) -> None:
-        rec = Recording(cast_path=failed_cast_file, command="false")
-        s = str(rec)
-        assert "fail" in s
-
-
-class TestRecordingMissingFile:
-    def test_missing_cast_file(self, tmp_path: Path) -> None:
-        rec = Recording(cast_path=tmp_path / "missing.cast", command="ls")
-        assert rec.output == ""
-        assert rec.events == []
-        assert rec.exit_code is None
-
-    def test_empty_cast_file(self, tmp_path: Path) -> None:
-        p = tmp_path / "empty.cast"
-        p.write_text("")
-        rec = Recording(cast_path=p, command="ls")
-        assert rec.output == ""
-        assert rec.events == []
+def test_duration_is_zero() -> None:
+    reply = semantic_pb2.CommandOutputReply(found=True, output="")
+    assert Recording.from_reply(reply, atuin_id="x").duration == 0.0
