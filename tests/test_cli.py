@@ -67,6 +67,21 @@ class TestCLIInitZsh:
         assert "add-zsh-hook" in capsys.readouterr().out
 
 
+class TestCLIStatus:
+    def test_status(self, db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        _seed(db_file, "abc")
+        ret = main(["--db", str(db_file), "status"])
+        assert ret == 0
+        out = capsys.readouterr().out
+        assert "daemon socket" in out
+        assert "recordings:      1" in out
+
+    def test_reconcile_status(self, capsys: pytest.CaptureFixture[str]) -> None:
+        ret = main(["reconcile", "status"])
+        assert ret == 0
+        assert "reconciler:" in capsys.readouterr().out
+
+
 class TestCLIRecordRemoved:
     def test_record_subcommand_gone(self) -> None:
         with pytest.raises(SystemExit) as exc:

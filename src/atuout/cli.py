@@ -64,6 +64,43 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    from atuout import reconciler
+
+    if args.daemonize:
+        return reconciler.run()
+    action = args.action or "ensure"
+    if action == "ensure":
+        spawned = reconciler.ensure()
+        print("started reconciler" if spawned else "reconciler already running")
+        return 0
+    if action == "status":
+        running = reconciler.is_running()
+        print(f"reconciler: {'running' if running else 'stopped'} (pid={reconciler.read_pid()})")
+        return 0
+    if action == "stop":
+        print("sent stop" if reconciler.stop() else "reconciler not running")
+        return 0
+    if action == "restart":
+        reconciler.stop()
+        reconciler.ensure()
+        print("restarted reconciler")
+        return 0
+    print(f"unknown reconcile action: {action}", file=sys.stderr)
+    return 2
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    from atuout import reconciler, settings, store
+
+    conn = store.connect(Path(args.db) if args.db else None)
+    print(f"daemon socket:   {settings.daemon_socket_path()}")
+    print(f"daemon enabled:  {settings.daemon_enabled()}")
+    print(f"reconciler:      {'running' if reconciler.is_running() else 'stopped'}")
+    print(f"recordings:      {store.count_recordings(conn)}")
+    return 0
+
+
 def cmd_init_zsh(_args: argparse.Namespace) -> int:
     """Print the zsh hook script to stdout for eval."""
     hook_text = _zsh_hook_text()
@@ -95,6 +132,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show", help="Show a stored recording by Atuin history id.")
     p_show.add_argument("atuin_id", help="Atuin history id.")
     p_show.set_defaults(func=cmd_show)
+
+    p_rec = sub.add_parser("reconcile", help="Manage the background reconciler.")
+    p_rec.add_argument(
+        "action",
+        nargs="?",
+        choices=["ensure", "status", "stop", "restart"],
+        default=None,
+        help="Management action (default: ensure).",
+    )
+    p_rec.add_argument(
+        "--daemonize", action="store_true", help="Run the reconciler loop (internal)."
+    )
+    p_rec.set_defaults(func=cmd_reconcile)
+
+    p_status = sub.add_parser("status", help="Show daemon/reconciler/store status.")
+    p_status.set_defaults(func=cmd_status)
 
     p_init = sub.add_parser("init-zsh", help="Print the zsh hook for eval.")
     p_init.set_defaults(func=cmd_init_zsh)
