@@ -53,6 +53,11 @@ class _HistoryServicer(history_pb2_grpc.HistoryServicer):
     def __init__(self, events: queue.Queue[history_pb2.TailHistoryReply | None]) -> None:
         self._events = events
 
+    def Status(self, request, context):  # noqa: N802 (grpc naming)
+        return history_pb2.StatusReply(
+            healthy=True, version="fake-daemon", pid=0, protocol=1
+        )
+
     def TailHistory(self, request, context):  # noqa: N802 (grpc naming)
         while context.is_active():
             try:

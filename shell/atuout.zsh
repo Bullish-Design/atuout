@@ -25,6 +25,10 @@ typeset -g _atuout_command=""
 # ── start the reconciler once (system-wide; no-op if already running) ─
 atuout reconcile ensure &>/dev/null
 
+# ── one-time soft capability check: warn (to stderr) if the reachable atuin daemon
+#    is too old to capture output. Backgrounded so it never delays shell startup. ─
+atuout check &!
+
 # ── hooks ────────────────────────────────────────────────────────────
 
 _atuout_preexec() {

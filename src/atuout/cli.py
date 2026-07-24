@@ -90,14 +90,53 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     return 2
 
 
+def _capture_warning(p: object) -> str | None:
+    """One-line warning if the daemon is reachable but lacks command-output capture."""
+    from atuout.probe import Probe
+
+    assert isinstance(p, Probe)
+    if p.reachable and p.capture_supported is False:
+        return (
+            "atuout: this atuin daemon has no command-output capture (needs atuin with "
+            "PR #3510, i.e. >= 18.18.0-beta.2). Captures will not be harvested."
+        )
+    return None
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     from atuout import reconciler, settings, store
+    from atuout.probe import probe
 
     conn = store.connect(Path(args.db) if args.db else None)
+    p = probe(settings.daemon_socket_path())
+
+    if not p.reachable:
+        daemon_line = f"unreachable ({p.detail})"
+    else:
+        cap = {True: "yes", False: "no", None: "unknown"}[p.capture_supported]
+        daemon_line = f"reachable (version {p.version}, protocol {p.protocol}, capture: {cap})"
+
     print(f"daemon socket:   {settings.daemon_socket_path()}")
     print(f"daemon enabled:  {settings.daemon_enabled()}")
+    print(f"daemon:          {daemon_line}")
     print(f"reconciler:      {'running' if reconciler.is_running() else 'stopped'}")
     print(f"recordings:      {store.count_recordings(conn)}")
+
+    warning = _capture_warning(p)
+    if warning:
+        print(warning, file=sys.stderr)
+    return 0
+
+
+def cmd_check(_args: argparse.Namespace) -> int:
+    """Startup capability check for the shell hook: warn (to stderr) if the reachable daemon
+    can't capture output. Silent when the daemon is unreachable (it may start lazily) or fine.
+    Always exits 0 so it never disrupts shell startup."""
+    from atuout.probe import probe
+
+    warning = _capture_warning(probe())
+    if warning:
+        print(warning, file=sys.stderr)
     return 0
 
 
@@ -148,6 +187,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="Show daemon/reconciler/store status.")
     p_status.set_defaults(func=cmd_status)
+
+    p_check = sub.add_parser(
+        "check", help="Warn if the atuin daemon lacks command-output capture (used by init-zsh)."
+    )
+    p_check.set_defaults(func=cmd_check)
 
     p_init = sub.add_parser("init-zsh", help="Print the zsh hook for eval.")
     p_init.set_defaults(func=cmd_init_zsh)

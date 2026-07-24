@@ -75,6 +75,14 @@ class DaemonClient:
         except grpc.RpcError as e:
             raise DaemonError(str(e), kind=_classify(e)) from e
 
+    def status(self) -> history_pb2.StatusReply:
+        """Fetch daemon health/version/protocol (History.Status)."""
+        stub = history_pb2_grpc.HistoryStub(self._channel)
+        try:
+            return stub.Status(history_pb2.StatusRequest(), timeout=CALL_TIMEOUT_S)
+        except grpc.RpcError as e:
+            raise DaemonError(str(e), kind=_classify(e)) from e
+
     def tail_history(self) -> Iterator[history_pb2.TailHistoryReply]:
         """Yield a TailHistoryReply for every history STARTED/ENDED event (long-lived)."""
         stub = history_pb2_grpc.HistoryStub(self._channel)

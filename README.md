@@ -8,7 +8,13 @@ daemon buffer; atuout **harvests** those captures over gRPC into its own SQLite 
 ## Requirements
 
 atuout **requires** your shell to run inside `atuin pty-proxy` — there is no fallback. Atuin must
-be built with the `daemon` + `pty-proxy` features and have `daemon.enabled = true`.
+be built with the `daemon` + `pty-proxy` features, have `daemon.enabled = true`, and be new
+enough to include the command-output capture service (atuin PR #3510, i.e. **≥ 18.18.0-beta.2**).
+
+atuout talks to whatever atuin daemon is at `daemon.socket_path`, so on NixOS it integrates with
+your **system** atuin. It doesn't compare version strings; instead it probes the daemon's
+capability. `atuout status` reports it (`capture: yes/no`), and `init-zsh` runs a one-time
+background `atuout check` that prints a warning if your atuin is too old to capture output.
 
 ## Quickstart
 

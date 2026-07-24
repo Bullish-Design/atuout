@@ -27,6 +27,9 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("ATUOUT_DB_PATH", str(tmp_path / "atuout.db"))
     monkeypatch.setenv("ATUOUT_STATE_DIR", str(tmp_path / "state"))
+    # Point at a nonexistent socket by default so probes are deterministically "unreachable"
+    # and never touch a real atuin daemon; fixtures that need one override this.
+    monkeypatch.setenv("ATUOUT_DAEMON_SOCKET", str(tmp_path / "no-daemon.sock"))
 
 
 @pytest.fixture

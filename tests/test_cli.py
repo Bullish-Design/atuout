@@ -68,6 +68,7 @@ class TestCLIInitZsh:
         assert "add-zsh-hook" in out
         assert "ATUIN_PTY_PROXY_ACTIVE" in out
         assert "atuout harvest" in out
+        assert "atuout check" in out
 
 
 class TestCLIStatus:
@@ -77,7 +78,23 @@ class TestCLIStatus:
         assert ret == 0
         out = capsys.readouterr().out
         assert "daemon socket" in out
+        assert "daemon:" in out  # active probe line
         assert "recordings:      1" in out
+
+    def test_check_silent_when_daemon_unreachable(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Default fixture points at a nonexistent socket → unreachable → no warning, exit 0.
+        ret = main(["check"])
+        assert ret == 0
+        assert capsys.readouterr().err == ""
+
+    def test_check_warns_when_capture_unsupported(
+        self, fake_daemon_unimplemented, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ret = main(["check"])
+        assert ret == 0
+        assert "command-output capture" in capsys.readouterr().err
 
     def test_reconcile_status(self, capsys: pytest.CaptureFixture[str]) -> None:
         ret = main(["reconcile", "status"])
