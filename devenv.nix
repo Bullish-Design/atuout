@@ -9,6 +9,7 @@
     pkgs.git
     pkgs.uv
     pkgs.jq
+    pkgs.atuin  # for the live-daemon integration test (tests/test_integration_daemon.py)
     ];
 
   # grpcio ships a C extension that dlopen's libstdc++ at import time; expose it

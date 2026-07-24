@@ -48,7 +48,14 @@ class DaemonClient:
 
     def __init__(self, socket_path: str) -> None:
         self._socket_path = socket_path
-        self._channel = grpc.insecure_channel(f"unix:{socket_path}")
+        # grpcio's C-core derives the HTTP/2 ``:authority`` from the target; over a ``unix:``
+        # socket that becomes the socket path, which tonic/hyper (atuin's daemon) rejects as a
+        # malformed authority with an immediate RST_STREAM. Pin a valid authority so the
+        # handshake succeeds. Verified against a live ``atuin daemon`` (18.16.1).
+        self._channel = grpc.insecure_channel(
+            f"unix:{socket_path}",
+            options=[("grpc.default_authority", "localhost")],
+        )
 
     def close(self) -> None:
         self._channel.close()
