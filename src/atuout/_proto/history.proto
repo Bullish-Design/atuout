@@ -10,12 +10,18 @@ message StartHistoryRequest {
   string hostname = 5;
   string author = 6;
   string intent = 7;
+  string shell = 8;
 }
 
 message EndHistoryRequest {
   string id = 1;
   int64 exit = 2;
   uint64 duration = 3;
+}
+
+// Cancel an in-progress history entry without adding it to the database.
+message CancelHistoryRequest {
+  string id = 1;
 }
 
 message StartHistoryReply {
@@ -29,6 +35,11 @@ message EndHistoryReply {
   uint64 idx = 2;
   string version = 3;
   uint32 protocol = 4;
+}
+
+message CancelHistoryReply {
+  string version = 1;
+  uint32 protocol = 2;
 }
 
 message StatusRequest {}
@@ -65,6 +76,7 @@ message HistoryEntry {
   string intent = 8;
   int64 exit = 9;
   int64 duration = 10;
+  string shell = 11;
 }
 
 message TailHistoryReply {
@@ -75,6 +87,7 @@ message TailHistoryReply {
 service History {
   rpc StartHistory(StartHistoryRequest) returns (StartHistoryReply);
   rpc EndHistory(EndHistoryRequest) returns (EndHistoryReply);
+  rpc CancelHistory(CancelHistoryRequest) returns (CancelHistoryReply);
   rpc TailHistory(TailHistoryRequest) returns (stream TailHistoryReply);
   rpc Status(StatusRequest) returns (StatusReply);
   rpc Shutdown(ShutdownRequest) returns (ShutdownReply);

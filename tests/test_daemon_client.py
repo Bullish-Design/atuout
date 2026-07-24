@@ -6,6 +6,7 @@ import pytest
 
 from atuout._proto import history_pb2
 from atuout.daemon_client import DaemonClient, DaemonError
+from atuout.recording import reply_output_text
 from atuout.settings import daemon_socket_path
 from tests.support.fake_daemon import FakeDaemon
 
@@ -15,10 +16,12 @@ def test_command_output_found(fake_daemon: FakeDaemon) -> None:
     with DaemonClient(daemon_socket_path()) as client:
         reply = client.command_output("abc")
     assert reply.found is True
-    assert reply.output == "hello\nworld\n"
+    # The real daemon leaves `output` empty and returns content via `lines`.
+    assert reply.output == ""
     assert reply.total_lines == 2
     assert reply.total_bytes == len(b"hello\nworld\n")
     assert [line.content for line in reply.lines] == ["hello", "world"]
+    assert reply_output_text(reply) == "hello\nworld"
 
 
 def test_command_output_not_found(fake_daemon: FakeDaemon) -> None:

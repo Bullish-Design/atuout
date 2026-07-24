@@ -23,7 +23,7 @@ def test_reconcile_ended_backfills_missing(fake_daemon: FakeDaemon, db_file: Pat
     assert stored is True
     rec = store.get_recording(conn, "m1")
     assert rec is not None
-    assert rec.output == "captured\n"
+    assert rec.output == "captured"
     assert rec.command == "grep x"
     assert rec.exit_code == 3
     assert rec.source == "reconciler"

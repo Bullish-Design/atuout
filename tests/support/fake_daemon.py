@@ -35,9 +35,11 @@ class _SemanticServicer(semantic_pb2_grpc.SemanticServicer):
             return semantic_pb2.CommandOutputReply(found=False)
         output = str(cap["output"])
         lines = output.splitlines()
+        # Mirror the real daemon: the top-level `output` field is left empty; content is
+        # returned only via `lines` (see atuin-daemon semantic.rs command_output).
         return semantic_pb2.CommandOutputReply(
             found=True,
-            output=output,
+            output="",
             total_bytes=len(output.encode()),
             total_lines=len(lines),
             lines=[

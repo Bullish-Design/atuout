@@ -21,6 +21,7 @@ from atuout import store
 from atuout._proto import history_pb2
 from atuout.daemon_client import DaemonClient, DaemonError
 from atuout.log import get_logger
+from atuout.recording import reply_output_text
 from atuout.settings import daemon_socket_path, runtime_dir
 
 # More patient than the fast path — the reconciler isn't blocking anything.
@@ -120,7 +121,7 @@ def reconcile_ended(
                 conn,
                 atuin_id=entry.id,
                 command=entry.command or None,
-                output=reply.output,
+                output=reply_output_text(reply),
                 exit_code=entry.exit,
                 total_bytes=reply.total_bytes,
                 total_lines=reply.total_lines,

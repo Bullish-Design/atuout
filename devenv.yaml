@@ -8,6 +8,19 @@ inputs:
     url: github:nlewo/nix2container
   mk-shell-bin:
     url: github:rrbutani/nix-mk-shell-bin
+  # atuin source pinned to a commit that includes PR #3510 (native command-output capture:
+  # the Semantic gRPC service). Released atuin (18.16.1) predates it. flake:false so we build
+  # it from its own atuin.nix. Keep this commit in sync with src/atuout/_proto/README.md.
+  atuin-src:
+    url: github:atuinsh/atuin/2f9357e7246dbfb342a8807089e8dac3e60afec9
+    flake: false
+  # atuin main needs rustc >= 1.97; the pinned nixpkgs ships 1.95, so build it with a
+  # current stable toolchain from rust-overlay.
+  rust-overlay:
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
 
 
 # If you're using non-OSS software, you can set allowUnfree to true.

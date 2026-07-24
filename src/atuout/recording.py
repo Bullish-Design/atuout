@@ -15,6 +15,17 @@ if TYPE_CHECKING:
     from atuout._proto import semantic_pb2
 
 
+def reply_output_text(reply: semantic_pb2.CommandOutputReply) -> str:
+    """Reconstruct the captured output text from a CommandOutputReply.
+
+    The daemon returns the content in ``lines`` (line_number + content) and leaves the top-level
+    ``output`` field empty, so prefer ``output`` if present but fall back to joining ``lines``.
+    """
+    if reply.output:
+        return str(reply.output)
+    return "\n".join(str(line.content) for line in reply.lines)
+
+
 @dataclass
 class Recording:
     """Represents one captured shell command execution."""
@@ -67,7 +78,7 @@ class Recording:
             exit_code=exit_code,
             total_bytes=reply.total_bytes,
             total_lines=reply.total_lines,
-            _output=reply.output,
+            _output=reply_output_text(reply),
         )
 
     # ------------------------------------------------------------------

@@ -11,7 +11,7 @@ def test_harvest_found_persists(fake_daemon: FakeDaemon, db_file: Path) -> None:
     fake_daemon.add_capture("abc", "line1\nline2\n")
     rec = harvest("abc", command="ls", exit_code=0, db_path=db_file, attempts=2, delay_ms=1)
     assert rec is not None
-    assert rec.output == "line1\nline2\n"
+    assert rec.output == "line1\nline2"
     assert rec.command == "ls"
     assert rec.exit_code == 0
     conn = store.connect(db_file)
@@ -28,7 +28,7 @@ def test_harvest_retries_then_succeeds(fake_daemon: FakeDaemon, db_file: Path) -
     threading.Timer(0.02, add_later).start()
     rec = harvest("late", db_path=db_file, attempts=10, delay_ms=10)
     assert rec is not None
-    assert rec.output == "here\n"
+    assert rec.output == "here"
 
 
 def test_harvest_not_found_returns_none(fake_daemon: FakeDaemon, db_file: Path) -> None:
@@ -51,4 +51,4 @@ def test_harvest_idempotent(fake_daemon: FakeDaemon, db_file: Path) -> None:
     fake_daemon.add_capture("abc", "two\n")
     second = harvest("abc", command="b", db_path=db_file, attempts=2, delay_ms=1)
     assert first is not None and second is not None
-    assert second.output == "one\n"
+    assert second.output == "one"

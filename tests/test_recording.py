@@ -2,7 +2,29 @@ from __future__ import annotations
 
 from atuout import store
 from atuout._proto import semantic_pb2
-from atuout.recording import Recording
+from atuout.recording import Recording, reply_output_text
+
+
+def test_reply_output_text_from_lines() -> None:
+    # Real daemon shape: output field empty, content only in lines.
+    reply = semantic_pb2.CommandOutputReply(
+        found=True,
+        output="",
+        total_lines=2,
+        lines=[
+            semantic_pb2.OutputLine(line_number=1, content="first"),
+            semantic_pb2.OutputLine(line_number=2, content="second"),
+        ],
+    )
+    assert reply_output_text(reply) == "first\nsecond"
+    rec = Recording.from_reply(reply, atuin_id="x")
+    assert rec.output == "first\nsecond"
+    assert rec.output_lines == ["first", "second"]
+
+
+def test_reply_output_text_prefers_output_field() -> None:
+    reply = semantic_pb2.CommandOutputReply(found=True, output="literal\n")
+    assert reply_output_text(reply) == "literal\n"
 
 
 def test_from_reply_populates_fields() -> None:

@@ -9,7 +9,7 @@ from pathlib import Path
 from atuout import store
 from atuout.daemon_client import DaemonClient, DaemonError
 from atuout.log import get_logger
-from atuout.recording import Recording
+from atuout.recording import Recording, reply_output_text
 from atuout.settings import daemon_socket_path
 
 DEFAULT_ATTEMPTS = 3
@@ -71,7 +71,7 @@ def harvest(
                         conn,
                         atuin_id=atuin_id,
                         command=command,
-                        output=reply.output,
+                        output=reply_output_text(reply),
                         exit_code=exit_code,
                         total_bytes=reply.total_bytes,
                         total_lines=reply.total_lines,
