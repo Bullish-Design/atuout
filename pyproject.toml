@@ -23,6 +23,7 @@ dev = [
   "mypy>=1.10",
   "ruff>=0.5.0",
   "grpcio-tools>=1.60",
+  "pexpect>=4.9",
 ]
 
 [project.scripts]
@@ -55,6 +56,9 @@ include = [
 [tool.pytest.ini_options]
 addopts = "-q --cov=atuout --cov-report=term-missing"
 testpaths = ["tests"]
+markers = [
+  "slow: spawns real processes / waits on timers (opt-in integration tests)",
+]
 
 [tool.coverage.run]
 omit = ["src/atuout/_proto/*"]

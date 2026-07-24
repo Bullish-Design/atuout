@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.atuin_daemon import spawn_atuin_daemon
 from tests.support.fake_daemon import FakeDaemon
 
 _ATUOUT_ENV = (
@@ -30,6 +31,16 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Point at a nonexistent socket by default so probes are deterministically "unreachable"
     # and never touch a real atuin daemon; fixtures that need one override this.
     monkeypatch.setenv("ATUOUT_DAEMON_SOCKET", str(tmp_path / "no-daemon.sock"))
+
+
+@pytest.fixture
+def atuin_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """A real ``atuin daemon`` under a temp HOME; yields its socket path.
+
+    Shared by the live integration suites (``test_integration_daemon`` and
+    ``test_integration_pty_proxy``). Skips when the daemon can't create its socket.
+    """
+    yield from spawn_atuin_daemon(tmp_path, monkeypatch)
 
 
 @pytest.fixture

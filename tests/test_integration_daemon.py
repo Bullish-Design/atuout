@@ -8,14 +8,8 @@ capture service (atuin PR #3510) is not in released atuin yet, so CommandOutput 
 
 from __future__ import annotations
 
-import contextlib
-import os
 import shutil
-import signal
-import subprocess
 import threading
-import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -23,41 +17,11 @@ import pytest
 from atuout._proto import history_pb2
 from atuout.daemon_client import DaemonClient, DaemonError
 from atuout.recording import reply_output_text
+from tests.support.atuin_daemon import semantic_available as _semantic_available
 
 pytestmark = pytest.mark.skipif(
     shutil.which("atuin") is None, reason="atuin binary not available"
 )
-
-
-@pytest.fixture
-def atuin_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.delenv("ATUOUT_DAEMON_SOCKET", raising=False)
-    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
-    sock = home / ".local" / "share" / "atuin" / "atuin.sock"
-
-    # Run the daemon in the foreground in its own session so we can kill the whole process
-    # group in teardown (`daemon start` double-forks and detaches, which we can't reap).
-    proc = subprocess.Popen(
-        ["atuin", "daemon"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    try:
-        deadline = time.time() + 15
-        while time.time() < deadline and not sock.exists():
-            time.sleep(0.1)
-        if not sock.exists():
-            pytest.skip("atuin daemon did not create its socket")
-        yield str(sock)
-    finally:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=5)
 
 
 def test_socket_path_matches_settings(atuin_daemon: str) -> None:
@@ -195,15 +159,6 @@ def test_reconciler_backfill_end_to_end(atuin_daemon: str, tmp_path: Path) -> No
     assert got is not None
     assert got.output == "out"
     assert got.source == "reconciler"
-
-
-def _semantic_available(sock: str) -> bool:
-    with DaemonClient(sock) as client:
-        try:
-            client.command_output("probe")
-            return True
-        except DaemonError as e:
-            return e.kind != "unimplemented"
 
 
 def test_capture_roundtrip_via_record_commands(atuin_daemon: str) -> None:
