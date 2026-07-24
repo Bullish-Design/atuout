@@ -90,3 +90,14 @@ class DaemonClient:
             yield from stub.TailHistory(history_pb2.TailHistoryRequest())
         except grpc.RpcError as e:
             raise DaemonError(str(e), kind=_classify(e)) from e
+
+    def tail_history_call(self) -> grpc.Future:
+        """Return the raw streaming call for History.TailHistory.
+
+        Unlike ``tail_history``, this exposes the underlying grpc call object so a caller can
+        ``cancel()`` it from another thread to unblock a thread parked in its iterator — grpcio's
+        blocking iteration is not interruptible by Python signals, so cancellation is the only
+        reliable way to stop it promptly. Iterating it raises ``grpc.RpcError`` on cancel/disconnect.
+        """
+        stub = history_pb2_grpc.HistoryStub(self._channel)
+        return stub.TailHistory(history_pb2.TailHistoryRequest())

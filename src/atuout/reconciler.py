@@ -12,10 +12,13 @@ import os
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import IO
+
+import grpc
 
 from atuout import store
 from atuout._proto import history_pb2
@@ -139,29 +142,65 @@ def reconcile_ended(
     return False
 
 
-def _run_loop(stop_flag: dict[str, bool]) -> None:
+class _Control:
+    """Shared state between the signal handler (main thread) and the tail worker thread."""
+
+    def __init__(self) -> None:
+        self.stop = threading.Event()
+        self._lock = threading.Lock()
+        self._call: grpc.Future | None = None
+
+    def set_call(self, call: grpc.Future | None) -> None:
+        with self._lock:
+            self._call = call
+
+    def request_stop(self) -> None:
+        """Signal-handler-safe: flag stop and cancel any in-flight tail call to unblock it."""
+        self.stop.set()
+        with self._lock:
+            if self._call is not None:
+                with contextlib.suppress(Exception):
+                    self._call.cancel()
+
+
+def _run_loop(control: _Control) -> None:
+    """Tail history and reconcile ENDED events until stop is requested.
+
+    Runs on a worker thread so the main thread can observe SIGTERM and cancel the (otherwise
+    signal-opaque) blocking tail iterator via ``control.request_stop()``.
+    """
     log = get_logger()
-    conn = store.connect()
+    conn = store.connect()  # created on this thread; sqlite connections are thread-affine
     socket_path = daemon_socket_path()
     backoff = _RECONNECT_MIN_S
 
-    while not stop_flag["stop"]:
+    while not control.stop.is_set():
         try:
             with DaemonClient(socket_path) as client:
+                call = client.tail_history_call()
+                control.set_call(call)
+                if control.stop.is_set():  # stop raced in before we registered the call
+                    call.cancel()
+                    return
                 log.info("reconciler: tailing history")
                 backoff = _RECONNECT_MIN_S
-                for reply in client.tail_history():
-                    if stop_flag["stop"]:
+                for reply in call:
+                    if control.stop.is_set():
                         return
                     if reply.kind == history_pb2.HISTORY_EVENT_KIND_ENDED:
                         reconcile_ended(conn, client, reply.history)
-        except DaemonError as e:
+        except grpc.RpcError as e:
+            if control.stop.is_set():  # cancelled by request_stop()
+                return
             log.warning("reconciler: stream error (%s); reconnecting in %.0fs", e, backoff)
+        except DaemonError as e:
+            log.warning("reconciler: daemon error (%s); reconnecting in %.0fs", e, backoff)
         except Exception as e:  # keep the reconciler alive across unexpected errors
             log.error("reconciler: unexpected error: %s; reconnecting in %.0fs", e, backoff)
-        if stop_flag["stop"]:
+        finally:
+            control.set_call(None)
+        if control.stop.wait(backoff):
             return
-        time.sleep(backoff)
         backoff = min(backoff * 2, _RECONNECT_MAX_S)
 
 
@@ -171,17 +210,23 @@ def run() -> int:
     if lock is None:
         return 0  # another instance already running
 
-    stop_flag = {"stop": False}
+    control = _Control()
 
     def _handle(_signum: int, _frame: object) -> None:
-        stop_flag["stop"] = True
+        control.request_stop()
 
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
 
     _write_pidfile()
+    worker = threading.Thread(target=_run_loop, args=(control,), name="reconciler-tail")
+    worker.start()
     try:
-        _run_loop(stop_flag)
+        # Poll so the main thread stays responsive to signals (their handler sets the event).
+        while not control.stop.wait(0.25):
+            if not worker.is_alive():  # worker only exits after stop; guard against surprises
+                break
+        worker.join(timeout=5)
     finally:
         _remove_pidfile()
         with contextlib.suppress(OSError):
