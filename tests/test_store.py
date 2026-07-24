@@ -52,6 +52,23 @@ def test_has_recording(db_file: Path) -> None:
     assert store.has_recording(conn, "abc") is True
 
 
+def test_wal_mode_and_indexes_on_disk(db_file: Path) -> None:
+    conn = store.connect(db_file)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert "idx_recordings_captured_at" in indexes
+
+
+def test_concurrent_writers_do_not_error(db_file: Path) -> None:
+    # WAL + busy_timeout should let two independent connections (as separate processes:
+    # the fast-path harvest and the reconciler) both write without "database is locked".
+    c1 = store.connect(db_file)
+    c2 = store.connect(db_file)
+    assert _seed(c1, "from-harvest") is True
+    assert _seed(c2, "from-reconciler") is True
+    assert store.count_recordings(store.connect(db_file)) == 2
+
+
 def test_list_newest_first(db_file: Path) -> None:
     conn = store.connect(db_file)
     _seed(conn, "old", captured_at_ms=1000)
