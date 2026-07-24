@@ -220,3 +220,6 @@ __marimo__/
 
 # Vendored atuin reference source (do not commit)
 .scratch/projects/001-native-refactor/reference/
+
+# nix build symlink
+result
