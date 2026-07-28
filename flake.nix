@@ -33,6 +33,34 @@
 
           build-system = [ pkgs.python3Packages.hatchling ];
 
+          # Regenerate _pb2.py / _pb2_grpc.py from .proto sources at build time
+          # so the gencode version always matches the protobuf runtime in nixpkgs.
+          # Use pkgs.protobuf + pkgs.grpc (not grpcio-tools) so protoc and the
+          # gRPC plugin match the protobuf/grpcio runtime versions exactly.
+          nativeBuildInputs = [
+            pkgs.protobuf  # provides protoc
+            pkgs.grpc       # provides grpc_python_plugin
+          ];
+
+          preBuild = ''
+            proto_dir="src/atuout/_proto"
+            chmod -R u+w "$proto_dir"
+
+            protoc \
+              -I "$proto_dir" \
+              --python_out="$proto_dir" \
+              --grpc_python_out="$proto_dir" \
+              --plugin=protoc-gen-grpc_python="${pkgs.grpc}/bin/grpc_python_plugin" \
+              "$proto_dir/semantic.proto" \
+              "$proto_dir/history.proto"
+
+            # Rewrite absolute imports to package-relative so
+            # `from atuout._proto import ...` works.
+            for f in "$proto_dir"/*_pb2_grpc.py; do
+              sed -i -E 's/^import (semantic_pb2|history_pb2) as /from atuout._proto import \1 as /' "$f"
+            done
+          '';
+
           # Runtime deps mirror pyproject [project.dependencies]. grpcio in
           # nixpkgs already links its native libs, so no LD_LIBRARY_PATH shim is
           # needed at runtime (unlike the devenv, which builds wheels via uv).
