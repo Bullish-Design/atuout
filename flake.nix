@@ -22,7 +22,7 @@
           version = "0.1.0";
           pyproject = true;
 
-          # Git-tracked source only — never drag generated devenv/mypy state into
+          # Git-tracked source only — never drag generated devenv/ty state into
           # the store. cleanSource drops .git; the explicit filter drops the rest.
           src = nixpkgs.lib.cleanSourceWith {
             src = ./.;

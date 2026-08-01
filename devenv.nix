@@ -61,7 +61,7 @@ in
     git --version | grep --color=auto "${pkgs.git.version}"
     uv sync --extra dev
     uv run ruff check src tests
-    uv run mypy
+    uv run ty check
     uv run pytest
   '';
 

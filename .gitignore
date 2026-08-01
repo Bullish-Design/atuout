@@ -166,8 +166,8 @@ venv.bak/
 # mkdocs documentation
 /site
 
-# mypy
-.mypy_cache/
+# ty
+.mypy_cache/  # leftover from the pre-ty era; safe to delete
 .dmypy.json
 dmypy.json
 

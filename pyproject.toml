@@ -20,7 +20,7 @@ dependencies = [
 dev = [
   "pytest>=7.0",
   "pytest-cov>=4.1",
-  "mypy>=1.10",
+  "ty>=0.0.56",
   "ruff>=0.5.0",
   "grpcio-tools>=1.60",
   "pexpect>=4.9",
@@ -63,29 +63,27 @@ markers = [
 [tool.coverage.run]
 omit = ["src/atuout/_proto/*"]
 
-[tool.mypy]
-python_version = "3.13"
-mypy_path = "src"
-packages = ["atuout"]
+[tool.ty.environment]
+python-version = "3.13"
+# src-layout: only atuout is first-party; matches the old mypy `mypy_path`/`packages`.
+root = ["./src"]
+
+[tool.ty.analysis]
+# grpcio ships no type info; mirrors mypy's `ignore_missing_imports` override for grpc.
+# Generated _proto modules define members at runtime via `__getattr__`; treat them as Any,
+# like mypy's `follow_imports = "skip"` + `ignore_errors` override.
+replace-imports-with-any = ["grpc.**", "atuout._proto.**"]
+
+[tool.ty.src]
+# Check only the package (mypy used `packages = ["atuout"]`); leave tests to ruff/pytest.
+include = ["src"]
+# Protobuf-generated code: checked at build time by the gencode test instead.
 exclude = ["src/atuout/_proto/"]
-strict = true
-warn_unused_ignores = true
-warn_redundant_casts = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-disallow_incomplete_defs = true
-disallow_untyped_calls = true
-no_implicit_optional = true
 
-[[tool.mypy.overrides]]
-module = ["atuout._proto.*"]
-ignore_errors = true
-follow_imports = "skip"
-follow_imports_for_stubs = true
-
-[[tool.mypy.overrides]]
-module = ["grpc"]
-ignore_missing_imports = true
+[tool.ty.rules]
+# Approximate mypy --strict for the checks ty leaves disabled by default.
+missing-type-argument = "error"
+possibly-unresolved-reference = "warn"
 
 [tool.ruff]
 line-length = 120
