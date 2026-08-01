@@ -19,7 +19,7 @@
       packages = forAllSystems ({ pkgs, ... }: rec {
         atuout = pkgs.python3Packages.buildPythonApplication {
           pname = "atuout";
-          version = "0.1.0";
+          version = "0.1.1";
           pyproject = true;
 
           # Git-tracked source only — never drag generated devenv/ty state into
@@ -28,7 +28,7 @@
             src = ./.;
             filter = path: _type:
               let base = baseNameOf path; in
-              !(builtins.elem base [ ".devenv" ".mypy_cache" ".coverage" "result" ]);
+              !(builtins.elem base [ ".devenv" ".coverage" "result" ]);
           };
 
           build-system = [ pkgs.python3Packages.hatchling ];

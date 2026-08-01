@@ -166,14 +166,6 @@ venv.bak/
 # mkdocs documentation
 /site
 
-# ty
-.mypy_cache/  # leftover from the pre-ty era; safe to delete
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
 # pytype static type analyzer
 .pytype/
 
