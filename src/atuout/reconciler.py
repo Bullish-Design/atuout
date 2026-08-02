@@ -22,6 +22,7 @@ import grpc
 
 from atuout import store
 from atuout._proto import history_pb2
+from atuout.agent_ingest import AGENT_AUTHORS, ingest_entry
 from atuout.daemon_client import DaemonClient, DaemonError
 from atuout.log import get_logger
 from atuout.recording import reply_output_text
@@ -106,6 +107,18 @@ def reconcile_ended(
     log = get_logger()
     if store.has_recording(conn, entry.id):
         return False
+
+    # Agent-run commands (recorded by atuin's hooks) never have a daemon
+    # capture; recover their output from the agent's session transcript instead.
+    if entry.author in AGENT_AUTHORS:
+        return ingest_entry(
+            conn,
+            atuin_id=entry.id,
+            command=entry.command,
+            author=entry.author,
+            exit_code=entry.exit,
+            timestamp_ns=entry.timestamp,
+        )
 
     for attempt in range(1, attempts + 1):
         try:
