@@ -1,6 +1,6 @@
 [project]
 name = "atuout"
-version = "0.1.1"
+version = "0.2.0"
 description = "Shell command-output harvester — archives Atuin's native command captures, linked to Atuin history."
 readme = "README.md"
 requires-python = ">=3.11"

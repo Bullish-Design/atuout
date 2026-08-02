@@ -19,7 +19,7 @@
       packages = forAllSystems ({ pkgs, ... }: rec {
         atuout = pkgs.python3Packages.buildPythonApplication {
           pname = "atuout";
-          version = "0.1.1";
+          version = "0.2.0";
           pyproject = true;
 
           # Git-tracked source only — never drag generated devenv/ty state into

@@ -150,6 +150,23 @@ def cmd_init_zsh(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ingest_agent(args: argparse.Namespace) -> int:
+    """Backfill outputs for agent-run commands from agent session transcripts."""
+    from atuout import agent_ingest, store
+
+    authors = tuple(args.agents) if args.agents else agent_ingest.AGENT_AUTHORS
+    conn = store.connect(Path(args.db) if args.db else None)
+    n = agent_ingest.backfill(
+        conn,
+        authors=authors,
+        limit=args.limit,
+        dry_run=args.dry_run,
+    )
+    verb = "would ingest" if args.dry_run else "ingested"
+    print(f"{verb} {n} agent command{'s' if n != 1 else ''}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="atuout",
@@ -195,6 +212,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = sub.add_parser("init-zsh", help="Print the zsh hook for eval.")
     p_init.set_defaults(func=cmd_init_zsh)
+
+    p_ingest = sub.add_parser(
+        "ingest-agent",
+        help="Backfill outputs for agent-run commands from agent session transcripts.",
+    )
+    p_ingest.add_argument(
+        "--agent",
+        dest="agents",
+        action="append",
+        choices=["pi", "claude-code", "codex"],
+        help="Agent to ingest (repeatable; default: all supported).",
+    )
+    p_ingest.add_argument("--limit", type=int, default=None, help="Max entries to process.")
+    p_ingest.add_argument("--dry-run", action="store_true", help="Report without storing.")
+    p_ingest.set_defaults(func=cmd_ingest_agent)
 
     return parser
 
