@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 
@@ -156,10 +157,14 @@ def cmd_ingest_agent(args: argparse.Namespace) -> int:
 
     authors = tuple(args.agents) if args.agents else agent_ingest.AGENT_AUTHORS
     conn = store.connect(Path(args.db) if args.db else None)
+    since_ms = None
+    if args.since_hours is not None:
+        since_ms = int((time.time() - args.since_hours * 3600) * 1000)
     n = agent_ingest.backfill(
         conn,
         authors=authors,
         limit=args.limit,
+        since_ms=since_ms,
         dry_run=args.dry_run,
     )
     verb = "would ingest" if args.dry_run else "ingested"
@@ -225,6 +230,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Agent to ingest (repeatable; default: all supported).",
     )
     p_ingest.add_argument("--limit", type=int, default=None, help="Max entries to process.")
+    p_ingest.add_argument(
+        "--since-hours",
+        type=float,
+        default=None,
+        help="Only scan history from the last N hours (default: all history).",
+    )
     p_ingest.add_argument("--dry-run", action="store_true", help="Report without storing.")
     p_ingest.set_defaults(func=cmd_ingest_agent)
 

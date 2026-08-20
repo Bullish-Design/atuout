@@ -15,12 +15,13 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
 import grpc
 
-from atuout import store
+from atuout import agent_ingest, store
 from atuout._proto import history_pb2
 from atuout.agent_ingest import AGENT_AUTHORS, ingest_entry
 from atuout.daemon_client import DaemonClient, DaemonError
@@ -34,6 +35,16 @@ RECONCILE_DELAY_MS = 250
 
 _RECONNECT_MIN_S = 1.0
 _RECONNECT_MAX_S = 30.0
+
+# An agent writes the command's result to its transcript *after* the atuin hook
+# records the command, so the first lookup almost always misses. Retry on this
+# schedule (seconds after the previous try) before giving up on the entry.
+AGENT_RETRY_DELAYS_S = (2.0, 5.0, 15.0, 60.0, 300.0)
+
+# Final safety net: re-scan recent agent history for entries still missing
+# output. Catches whatever the retry queue lost to a restart or a long stall.
+AGENT_SWEEP_INTERVAL_S = 900.0
+AGENT_SWEEP_LOOKBACK_S = 6 * 3600.0
 
 
 def pidfile_path() -> Path:
@@ -94,6 +105,81 @@ def read_pid() -> int | None:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _PendingAgent:
+    """An agent entry whose transcript had no match yet, waiting for a retry."""
+
+    atuin_id: str
+    command: str
+    author: str
+    exit_code: int
+    timestamp_ns: int
+    attempt: int = 0
+    due_at: float = 0.0
+
+
+class _AgentRetryQueue:
+    """Agent entries to re-check once their transcript has caught up.
+
+    Thread-safe: the tail thread adds, the retry thread drains.
+    """
+
+    def __init__(
+        self,
+        delays: tuple[float, ...] = AGENT_RETRY_DELAYS_S,
+        now: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._delays = delays
+        self._now = now
+        self._lock = threading.Lock()
+        self._items: list[_PendingAgent] = []
+        self.wakeup = threading.Event()
+
+    def add(self, entry: history_pb2.HistoryEntry) -> None:
+        pending = _PendingAgent(
+            atuin_id=entry.id,
+            command=entry.command,
+            author=entry.author,
+            exit_code=entry.exit,
+            timestamp_ns=entry.timestamp,
+            due_at=self._now() + self._delays[0],
+        )
+        with self._lock:
+            self._items.append(pending)
+        self.wakeup.set()
+
+    def take_due(self) -> list[_PendingAgent]:
+        """Remove and return every entry whose retry time has arrived."""
+        now = self._now()
+        with self._lock:
+            due = [item for item in self._items if item.due_at <= now]
+            if due:
+                self._items = [item for item in self._items if item.due_at > now]
+        return due
+
+    def requeue(self, pending: _PendingAgent) -> bool:
+        """Schedule the next retry. False if the entry is out of attempts."""
+        pending.attempt += 1
+        if pending.attempt >= len(self._delays):
+            return False
+        pending.due_at = self._now() + self._delays[pending.attempt]
+        with self._lock:
+            self._items.append(pending)
+        return True
+
+    def next_delay(self, default: float) -> float:
+        """Seconds until the earliest retry is due, capped at ``default``."""
+        with self._lock:
+            if not self._items:
+                return default
+            soonest = min(item.due_at for item in self._items)
+        return max(0.0, min(default, soonest - self._now()))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
 def reconcile_ended(
     conn: sqlite3.Connection,
     client: DaemonClient,
@@ -102,6 +188,7 @@ def reconcile_ended(
     attempts: int = RECONCILE_ATTEMPTS,
     delay_ms: int = RECONCILE_DELAY_MS,
     sleep: Callable[[float], object] = time.sleep,
+    pending: _AgentRetryQueue | None = None,
 ) -> bool:
     """Backfill the capture for one ENDED history entry if missing. Returns True if stored."""
     log = get_logger()
@@ -109,9 +196,11 @@ def reconcile_ended(
         return False
 
     # Agent-run commands (recorded by atuin's hooks) never have a daemon
-    # capture; recover their output from the agent's session transcript instead.
+    # capture; recover their output from the agent's session transcript
+    # instead. The agent writes that transcript after the hook fires, so a miss
+    # here is expected — hand the entry to the retry queue rather than drop it.
     if entry.author in AGENT_AUTHORS:
-        return ingest_entry(
+        stored = ingest_entry(
             conn,
             atuin_id=entry.id,
             command=entry.command,
@@ -119,6 +208,9 @@ def reconcile_ended(
             exit_code=entry.exit,
             timestamp_ns=entry.timestamp,
         )
+        if not stored and pending is not None:
+            pending.add(entry)
+        return stored
 
     for attempt in range(1, attempts + 1):
         try:
@@ -176,7 +268,67 @@ class _Control:
                     self._call.cancel()
 
 
-def _run_loop(control: _Control) -> None:
+def drain_agent_retries(conn: sqlite3.Connection, pending: _AgentRetryQueue) -> int:
+    """Re-check every due agent entry. Returns how many stored this pass."""
+    log = get_logger()
+    stored = 0
+    for item in pending.take_due():
+        if store.has_recording(conn, item.atuin_id):
+            continue
+        ok = ingest_entry(
+            conn,
+            atuin_id=item.atuin_id,
+            command=item.command,
+            author=item.author,
+            exit_code=item.exit_code,
+            timestamp_ns=item.timestamp_ns,
+        )
+        if ok:
+            stored += 1
+            log.info("reconcile %s: stored from %s transcript", item.atuin_id, item.author)
+        elif not pending.requeue(item):
+            log.warning(
+                "reconcile %s: no %s transcript match after %d tries",
+                item.atuin_id,
+                item.author,
+                item.attempt,
+            )
+    return stored
+
+
+def _agent_retry_loop(control: _Control, pending: _AgentRetryQueue) -> None:
+    """Drain due agent retries, and periodically sweep recent history.
+
+    Runs on its own thread with its own sqlite connection: the tail thread must
+    never block on transcript parsing.
+    """
+    log = get_logger()
+    conn = store.connect()  # sqlite connections are thread-affine
+    next_sweep = time.monotonic() + AGENT_SWEEP_INTERVAL_S
+
+    while not control.stop.is_set():
+        wait_for = pending.next_delay(min(AGENT_SWEEP_INTERVAL_S, 5.0))
+        if pending.wakeup.wait(wait_for):
+            pending.wakeup.clear()
+        if control.stop.is_set():
+            return
+        try:
+            drain_agent_retries(conn, pending)
+        except Exception as e:  # a bad transcript must not kill the worker
+            log.error("reconciler: agent retry failed: %s", e)
+
+        if time.monotonic() >= next_sweep:
+            next_sweep = time.monotonic() + AGENT_SWEEP_INTERVAL_S
+            try:
+                since_ms = int((time.time() - AGENT_SWEEP_LOOKBACK_S) * 1000)
+                found = agent_ingest.backfill(conn, since_ms=since_ms)
+                if found:
+                    log.info("reconciler: sweep recovered %d agent command(s)", found)
+            except Exception as e:
+                log.error("reconciler: agent sweep failed: %s", e)
+
+
+def _run_loop(control: _Control, pending: _AgentRetryQueue) -> None:
     """Tail history and reconcile ENDED events until stop is requested.
 
     Runs on a worker thread so the main thread can observe SIGTERM and cancel the (otherwise
@@ -201,7 +353,7 @@ def _run_loop(control: _Control) -> None:
                     if control.stop.is_set():
                         return
                     if reply.kind == history_pb2.HISTORY_EVENT_KIND_ENDED:
-                        reconcile_ended(conn, client, reply.history)
+                        reconcile_ended(conn, client, reply.history, pending=pending)
         except grpc.RpcError as e:
             if control.stop.is_set():  # cancelled by request_stop()
                 return
@@ -224,22 +376,33 @@ def run() -> int:
         return 0  # another instance already running
 
     control = _Control()
+    pending = _AgentRetryQueue()
 
     def _handle(_signum: int, _frame: object) -> None:
         control.request_stop()
+        pending.wakeup.set()  # unblock the retry thread's wait
 
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
 
     _write_pidfile()
-    worker = threading.Thread(target=_run_loop, args=(control,), name="reconciler-tail")
+    worker = threading.Thread(
+        target=_run_loop, args=(control, pending), name="reconciler-tail"
+    )
+    retrier = threading.Thread(
+        target=_agent_retry_loop, args=(control, pending), name="reconciler-agent-retry"
+    )
     worker.start()
+    retrier.start()
     try:
         # Poll so the main thread stays responsive to signals (their handler sets the event).
         while not control.stop.wait(0.25):
             if not worker.is_alive():  # worker only exits after stop; guard against surprises
                 break
+        control.stop.set()  # the tail may have died on its own; stop the retrier too
+        pending.wakeup.set()
         worker.join(timeout=5)
+        retrier.join(timeout=5)
     finally:
         _remove_pidfile()
         with contextlib.suppress(OSError):

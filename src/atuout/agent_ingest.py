@@ -17,8 +17,10 @@ Supported agents / transcript formats:
 * **claude** — ``~/.claude/projects/<cwd-slug>/<session>.jsonl``. ``tool_use``
   (``name="Bash"``, ``input.command``) paired to ``tool_result`` by
   ``tool_use_id`` — exact, no ordering heuristics needed.
-* **codex** — not yet implemented (``response_item``/``custom_tool_call``
-  transcripts exist but need format verification).
+* **codex** — ``~/.codex/sessions/<date>/rollout-<session>.jsonl``. Shell calls
+  are ``payload.function_call`` (``name="exec_command"``) or
+  ``payload.custom_tool_call`` (``name="exec"``), paired to ``*_call_output``
+  by ``call_id`` — exact. See :func:`parse_codex_session` for the two shapes.
 
 Correlation with atuin history is by exact command text plus result-timestamp
 proximity to the history entry's timestamp.
@@ -28,9 +30,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,6 +45,11 @@ AGENT_AUTHORS = ("pi", "claude-code", "codex")
 # How close (ms) a recovered result timestamp must be to the history entry's
 # timestamp for us to consider it a match, when the command text matches.
 _MATCH_WINDOW_MS = 60_000
+
+# The live path (reconciler) only ever needs the session file the agent is
+# writing right now. Parse transcripts touched within this window of the
+# entry's timestamp; older ones cannot hold the call we want.
+_LIVE_TRANSCRIPT_SLACK_S = 300.0
 
 
 @dataclass
@@ -120,6 +128,139 @@ def parse_claude_session(path: Path) -> list[RecoveredCall]:
     return calls
 
 
+def parse_codex_session(path: Path) -> list[RecoveredCall]:
+    """Parse a Codex rollout JSONL (``call_id`` pairing, exact).
+
+    Codex records shell work in two shapes, both under ``event.payload``:
+
+    * ``function_call`` with ``name="exec_command"`` — ``arguments`` is a JSON
+      string holding the shell command in ``cmd``.
+    * ``custom_tool_call`` with ``name="exec"`` — ``input`` is a JavaScript
+      snippet that calls ``tools.exec_command({cmd: "..."})``. One snippet can
+      run several commands but the transcript keeps only one combined output,
+      so snippets with more than one command are skipped: their output cannot
+      be attributed to a single history entry.
+
+    Both pair to a ``function_call_output`` / ``custom_tool_call_output`` by
+    ``call_id``.
+    """
+    calls: list[RecoveredCall] = []
+    commands: dict[str, tuple[str, int | None]] = {}  # call_id -> (command, ts_ms)
+    for event in _iter_json(path):
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        ptype = payload.get("type")
+
+        if ptype == "function_call" and payload.get("name") == "exec_command":
+            command = _codex_argument_cmd(payload.get("arguments"))
+            if command:
+                commands[call_id] = (command, _ts_millis(event.get("timestamp")))
+        elif ptype == "custom_tool_call" and payload.get("name") == "exec":
+            found = _codex_script_commands(payload.get("input") or "")
+            if len(found) == 1:
+                commands[call_id] = (found[0], _ts_millis(event.get("timestamp")))
+        elif ptype in ("function_call_output", "custom_tool_call_output"):
+            pending = commands.pop(call_id, None)
+            if pending is None:
+                continue
+            command, ts_ms = pending
+            output = _codex_output_text(payload.get("output"))
+            calls.append(RecoveredCall(command=command, output=output, result_ts_ms=ts_ms))
+    return calls
+
+
+def _codex_argument_cmd(arguments: object) -> str:
+    """Read ``cmd`` out of a codex ``function_call.arguments`` JSON string."""
+    if not isinstance(arguments, str):
+        return ""
+    try:
+        parsed = json.loads(arguments)
+    except ValueError:
+        return ""
+    if isinstance(parsed, dict) and isinstance(parsed.get("cmd"), str):
+        return parsed["cmd"]
+    return ""
+
+
+# ``tools.exec_command({cmd: "...` — the key is sometimes quoted, sometimes not.
+_CODEX_CMD_KEY_RE = re.compile(r"""exec_command\(\s*\{\s*(?:"cmd"|'cmd'|cmd)\s*:\s*""")
+# The harness prepends a status block to every output: "Script completed\n
+# Wall time 0.3 seconds\nOutput:\n". It is not command output; drop it.
+_CODEX_HEADER_RE = re.compile(r"\AScript completed\n.*\nOutput:\n?\Z", re.DOTALL)
+
+_JS_ESCAPES = {
+    "n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0",
+}
+
+
+def _codex_script_commands(script: str) -> list[str]:
+    """Extract every shell command an ``exec`` snippet passes to exec_command."""
+    commands: list[str] = []
+    for match in _CODEX_CMD_KEY_RE.finditer(script):
+        literal = _js_string_at(script, match.end())
+        if literal is not None:
+            commands.append(literal)
+    return commands
+
+
+def _js_string_at(src: str, pos: int) -> str | None:
+    """Read the JavaScript string literal that starts at ``src[pos]``.
+
+    Handles the three quote forms and the escapes that turn up in shell
+    commands. Returns None if ``pos`` is not a quote or the literal is
+    unterminated (a template literal with ``${}`` keeps the placeholder text).
+    """
+    if pos >= len(src) or src[pos] not in "\"'`":
+        return None
+    quote = src[pos]
+    out: list[str] = []
+    i = pos + 1
+    while i < len(src):
+        char = src[i]
+        if char == "\\":
+            nxt = src[i + 1] if i + 1 < len(src) else ""
+            if nxt == "u" and _is_hex(src[i + 2 : i + 6]):
+                out.append(chr(int(src[i + 2 : i + 6], 16)))
+                i += 6
+                continue
+            if nxt == "x" and _is_hex(src[i + 2 : i + 4]):
+                out.append(chr(int(src[i + 2 : i + 4], 16)))
+                i += 4
+                continue
+            out.append(_JS_ESCAPES.get(nxt, nxt))
+            i += 2
+            continue
+        if char == quote:
+            return "".join(out)
+        out.append(char)
+        i += 1
+    return None
+
+
+def _is_hex(text: str) -> bool:
+    return len(text) > 0 and all(c in "0123456789abcdefABCDEF" for c in text)
+
+
+def _codex_output_text(output: object) -> str:
+    """Join a codex output block list, dropping the harness status header."""
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return ""
+    texts = [
+        block["text"]
+        for block in output
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+    if texts and _CODEX_HEADER_RE.match(texts[0]):
+        texts = texts[1:]
+    return "\n".join(texts)
+
+
 def _claude_result_text(content: object) -> str:
     """Claude tool_result content is a string, a list of text blocks, or a dict."""
     if isinstance(content, str):
@@ -141,34 +282,102 @@ def _claude_result_text(content: object) -> str:
 # ---------------------------------------------------------------------------
 
 
+_PARSERS: dict[str, Callable[[Path], list[RecoveredCall]]] = {
+    "pi": parse_pi_session,
+    "claude-code": parse_claude_session,
+    "codex": parse_codex_session,
+}
+
+
 def _agent_home(author: str) -> Path | None:
     home = Path.home()
     if author == "pi":
         return home / ".pi" / "agent" / "sessions"
     if author == "claude-code":
         return home / ".claude" / "projects"
-    return None  # codex: not implemented yet
+    if author == "codex":
+        return home / ".codex" / "sessions"
+    return None
 
 
-def iter_session_files(author: str) -> Iterator[Path]:
-    """Yield session JSONL files for an agent, newest mtime first."""
+def iter_session_files(author: str, *, modified_since_s: float | None = None) -> Iterator[Path]:
+    """Yield session JSONL files for an agent, newest mtime first.
+
+    ``modified_since_s`` (epoch seconds) drops transcripts untouched since then.
+    """
     base = _agent_home(author)
     if base is None:
         return
-    files = [p for p in base.rglob("*.jsonl") if p.is_file()]
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    yield from files
+    files: list[tuple[float, Path]] = []
+    for path in base.rglob("*.jsonl"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:  # rotated or removed while we scanned
+            continue
+        if modified_since_s is not None and mtime < modified_since_s:
+            continue
+        files.append((mtime, path))
+    files.sort(key=lambda item: item[0], reverse=True)
+    for _mtime, path in files:
+        yield path
 
 
-def build_index(authors: tuple[str, ...] = AGENT_AUTHORS) -> dict[str, list[RecoveredCall]]:
-    """Parse every session transcript for ``authors`` into a command-keyed index."""
+# Parsed transcripts, keyed by path and invalidated on (mtime, size). Only the
+# live path caches, and only over a short mtime window, so this holds the few
+# sessions currently being written — not every transcript on disk.
+_parse_cache: dict[Path, tuple[float, int, list[RecoveredCall]]] = {}
+
+
+def _parse_cached(
+    parser: Callable[[Path], list[RecoveredCall]], path: Path
+) -> list[RecoveredCall]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+    cached = _parse_cache.get(path)
+    if cached is not None and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+        return cached[2]
+    calls = parser(path)
+    _parse_cache[path] = (stat.st_mtime, stat.st_size, calls)
+    return calls
+
+
+def build_index(
+    authors: tuple[str, ...] = AGENT_AUTHORS,
+    *,
+    modified_since_s: float | None = None,
+    use_cache: bool = False,
+) -> dict[str, list[RecoveredCall]]:
+    """Parse the session transcripts for ``authors`` into a command-keyed index.
+
+    ``modified_since_s`` limits the scan to recently written transcripts.
+    ``use_cache`` reuses parses of unchanged files across calls; it also drops
+    cache entries the scan no longer covers, so the cache stays bounded.
+    """
     index: dict[str, list[RecoveredCall]] = {}
     for author in authors:
-        parser = parse_pi_session if author == "pi" else parse_claude_session
-        for path in iter_session_files(author):
-            for call in parser(path):
+        parser = _PARSERS.get(author)
+        if parser is None:
+            continue
+        scanned: set[Path] = set()
+        for path in iter_session_files(author, modified_since_s=modified_since_s):
+            scanned.add(path)
+            calls = _parse_cached(parser, path) if use_cache else parser(path)
+            for call in calls:
                 index.setdefault(call.command.rstrip(), []).append(call)
+        if use_cache:
+            _evict_outside(author, scanned)
     return index
+
+
+def _evict_outside(author: str, keep: set[Path]) -> None:
+    """Drop cached parses for ``author`` that the latest scan did not cover."""
+    base = _agent_home(author)
+    if base is None:
+        return
+    for path in [p for p in _parse_cache if p not in keep and p.is_relative_to(base)]:
+        del _parse_cache[path]
 
 
 def match_call(index: dict[str, list[RecoveredCall]], command: str, target_ms: int | None) -> RecoveredCall | None:
@@ -212,7 +421,12 @@ def ingest_entry(
     if author not in AGENT_AUTHORS:
         return False
     target_ms = (timestamp_ns or 0) // 1_000_000
-    best = match_call(build_index((author,)), command, target_ms)
+    # The agent appends the result to its transcript *after* the shell hook
+    # records the command, so the file we want was written at or after
+    # ``target_ms``. Scanning only that window keeps the live path cheap.
+    since_s = (target_ms / 1000.0) - _LIVE_TRANSCRIPT_SLACK_S if target_ms else None
+    index = build_index((author,), modified_since_s=since_s, use_cache=True)
+    best = match_call(index, command, target_ms)
     if best is None:
         return False
 
@@ -241,9 +455,14 @@ def backfill(
     *,
     authors: tuple[str, ...] = AGENT_AUTHORS,
     limit: int | None = None,
+    since_ms: int | None = None,
     dry_run: bool = False,
 ) -> int:
     """Scan atuin history for agent-authored entries missing recordings and ingest them.
+
+    ``since_ms`` bounds the sweep to history newer than that epoch time, and
+    narrows the transcript scan to match — use it for a periodic safety-net
+    pass. Without it the whole history and every transcript are read.
 
     Returns the number of entries ingested (or that would be ingested with
     ``dry_run=True``).
@@ -260,17 +479,22 @@ def backfill(
         placeholders = ",".join("?" for _ in authors)
         sql = (
             "SELECT id, command, author, exit, timestamp FROM history "
-            f"WHERE author IN ({placeholders}) AND deleted_at IS NULL "
-            "ORDER BY timestamp DESC"
+            f"WHERE author IN ({placeholders}) AND deleted_at IS NULL"
         )
+        params: tuple[object, ...] = authors
+        if since_ms is not None:
+            sql += " AND timestamp >= ?"
+            params += (since_ms * 1_000_000,)
+        sql += " ORDER BY timestamp DESC"
         if limit is not None:
             sql += " LIMIT ?"
-        params: tuple[object, ...] = authors + ((limit,) if limit is not None else ())
+            params += (limit,)
         rows = src.execute(sql, params).fetchall()
     finally:
         src.close()
 
-    index = build_index(authors)
+    since_s = (since_ms / 1000.0) - _LIVE_TRANSCRIPT_SLACK_S if since_ms is not None else None
+    index = build_index(authors, modified_since_s=since_s, use_cache=since_ms is not None)
     ingested = 0
     for row in rows:
         if store.has_recording(conn, row["id"]):

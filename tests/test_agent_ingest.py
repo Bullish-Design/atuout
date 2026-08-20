@@ -15,6 +15,7 @@ from atuout import agent_ingest, store
 # timestamps emitted by ``_pi_session_lines`` / the claude fixture.
 TS0_NS = int(datetime(2026, 8, 2, 20, 0, tzinfo=UTC).timestamp()) * 10**9
 TS0_MS = TS0_NS // 10**6
+TS0_ISO = "2026-08-02T20:00:00.000Z"
 
 
 def _pi_session_lines(
@@ -304,6 +305,164 @@ def test_backfill_dry_run_counts_without_storing(home_tmp: Path, db_file: Path, 
     conn = store.connect(db_file)
     assert agent_ingest.backfill(conn, dry_run=True) == 1
     assert store.count_recordings(conn) == 0
+
+
+# ---------------------------------------------------------------------------
+# parse_codex_session
+# ---------------------------------------------------------------------------
+
+
+def _codex_session(home: Path, events: list[dict]) -> Path:
+    return _write_jsonl(home / ".codex" / "sessions" / "2026" / "08" / "r.jsonl", events)
+
+
+def _codex_output(text: str, *, header: bool = True) -> list[dict]:
+    """Build a codex output block list, with the harness status header."""
+    blocks = []
+    if header:
+        blocks.append({"type": "input_text", "text": "Script completed\nWall time 0.3 seconds\nOutput:\n"})
+    blocks.append({"type": "input_text", "text": text})
+    return blocks
+
+
+def _codex_call(ptype: str, name: str, call_id: str, body: dict, ts: str) -> dict:
+    payload = {"type": ptype, "name": name, "call_id": call_id, **body}
+    return {"type": "response_item", "timestamp": ts, "payload": payload}
+
+
+def _codex_result(ptype: str, call_id: str, text: str) -> dict:
+    return {"type": "response_item", "payload": {"type": ptype, "call_id": call_id, "output": _codex_output(text)}}
+
+
+def test_parse_codex_function_call(home_tmp: Path) -> None:
+    """The ``exec_command`` function-call shape carries the command in JSON arguments."""
+    path = _codex_session(
+        home_tmp,
+        [
+            _codex_call(
+                "function_call", "exec_command", "call_1",
+                {"arguments": json.dumps({"cmd": "git status", "workdir": "/tmp"})},
+                "2026-08-02T20:00:00.000Z",
+            ),
+            _codex_result("function_call_output", "call_1", "on branch main"),
+        ],
+    )
+    calls = agent_ingest.parse_codex_session(path)
+    assert [(c.command, c.output) for c in calls] == [("git status", "on branch main")]
+    assert calls[0].result_ts_ms == TS0_MS
+
+
+def test_parse_codex_exec_script(home_tmp: Path) -> None:
+    """The ``exec`` shape hides the command inside a JavaScript snippet."""
+    script = (
+        'const r = await tools.exec_command({cmd:"echo \\"hi there\\"",'
+        '"workdir":"/tmp","yield_time_ms":30000});\ntext(r.output);'
+    )
+    path = _codex_session(
+        home_tmp,
+        [
+            _codex_call("custom_tool_call", "exec", "call_2", {"input": script}, TS0_ISO),
+            _codex_result("custom_tool_call_output", "call_2", "hi there"),
+        ],
+    )
+    calls = agent_ingest.parse_codex_session(path)
+    assert [(c.command, c.output) for c in calls] == [('echo "hi there"', "hi there")]
+
+
+def test_parse_codex_skips_multi_command_script(home_tmp: Path) -> None:
+    """One output cannot be split across two commands, so skip the snippet."""
+    script = (
+        'await tools.exec_command({cmd:"echo one"});\n'
+        'await tools.exec_command({cmd:"echo two"});'
+    )
+    path = _codex_session(
+        home_tmp,
+        [
+            _codex_call("custom_tool_call", "exec", "call_3", {"input": script}, TS0_ISO),
+            _codex_result("custom_tool_call_output", "call_3", "one\ntwo"),
+        ],
+    )
+    assert agent_ingest.parse_codex_session(path) == []
+
+
+def test_parse_codex_ignores_non_shell_calls(home_tmp: Path) -> None:
+    """Snippets that call no shell command produce nothing."""
+    path = _codex_session(
+        home_tmp,
+        [
+            _codex_call(
+                "custom_tool_call", "exec", "call_4",
+                {"input": "await tools.update_plan({});"}, TS0_ISO,
+            ),
+            _codex_result("custom_tool_call_output", "call_4", "ok"),
+            _codex_call("function_call", "wait", "call_5", {"arguments": "{}"}, TS0_ISO),
+            _codex_result("function_call_output", "call_5", "waited"),
+        ],
+    )
+    assert agent_ingest.parse_codex_session(path) == []
+
+
+def test_parse_codex_drops_status_header(home_tmp: Path) -> None:
+    """The `Script completed / Wall time` block is harness noise, not output."""
+    blocks = _codex_output("real output")
+    events = [
+        _codex_call("function_call", "exec_command", "c", {"arguments": '{"cmd":"ls"}'}, TS0_ISO),
+        {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "c", "output": blocks}},
+    ]
+    path = _codex_session(home_tmp, events)
+    assert agent_ingest.parse_codex_session(path)[0].output == "real output"
+
+
+def test_parse_codex_unpaired_call_is_dropped(home_tmp: Path) -> None:
+    """A call with no output (interrupted turn) yields no recording."""
+    path = _codex_session(
+        home_tmp,
+        [
+            _codex_call(
+                "function_call", "exec_command", "lonely",
+                {"arguments": '{"cmd":"sleep 99"}'}, TS0_ISO,
+            )
+        ],
+    )
+    assert agent_ingest.parse_codex_session(path) == []
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected"),
+    [
+        ('"plain"', "plain"),
+        ("'single'", "single"),
+        ("`backtick`", "backtick"),
+        (r'"a\nb"', "a\nb"),
+        (r'"quote\"inside"', 'quote"inside'),
+        (r'"tab\there"', "tab\there"),
+        (r'"hex\x41"', "hexA"),
+        (r'"uniA"', "uniA"),
+        (r'"back\\slash"', "back\\slash"),
+        ('"unterminated', None),
+        ("notaquote", None),
+    ],
+)
+def test_js_string_at(literal: str, expected: str | None) -> None:
+    assert agent_ingest._js_string_at(literal, 0) == expected
+
+
+def test_backfill_since_ms_bounds_the_scan(home_tmp: Path, db_file: Path, data_home_tmp: Path) -> None:
+    """A bounded sweep skips history older than the cutoff."""
+    _pi_session(home_tmp, _pi_session_lines([("bash", "echo old")]))
+    db = data_home_tmp / "atuin" / "history.db"
+    db.parent.mkdir(parents=True)
+    src = sqlite3.connect(str(db))
+    src.execute(
+        "CREATE TABLE history (id TEXT, command TEXT, author TEXT, exit INTEGER, timestamp INTEGER, deleted_at TEXT)"
+    )
+    src.execute("INSERT INTO history VALUES ('old', 'echo old', 'pi', 0, ?, NULL)", (TS0_NS,))
+    src.commit()
+    src.close()
+    conn = store.connect(db_file)
+    cutoff_ms = TS0_MS + 3_600_000
+    assert agent_ingest.backfill(conn, since_ms=cutoff_ms) == 0
+    assert agent_ingest.backfill(conn, since_ms=TS0_MS - 3_600_000) == 1
 
 
 # ---------------------------------------------------------------------------
