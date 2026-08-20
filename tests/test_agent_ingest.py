@@ -19,11 +19,12 @@ TS0_ISO = "2026-08-02T20:00:00.000Z"
 
 
 def _pi_session_lines(
-    calls: list[tuple[str, str]], *, parallel: bool = False
+    calls: list[tuple[str, str]], *, parallel: bool = False, output: str | None = None
 ) -> list[dict]:
     """Build a minimal pi session event stream.
 
-    Each (name, command) becomes a toolCall; outputs are ``"out:<name>"``.
+    Each (name, command) becomes a toolCall. Outputs are ``"out:<name>"``
+    unless ``output`` supplies one shared result.
     Sequential mode emits one assistant event + one toolResult per call;
     parallel mode batches all calls into one assistant event followed by one
     toolResult per call.
@@ -51,7 +52,7 @@ def _pi_session_lines(
                     "timestamp": f"2026-08-02T20:0{i}:00.000Z",
                     "message": {
                         "role": "toolResult",
-                        "content": [{"type": "text", "text": f"out:{name}"}],
+                        "content": [{"type": "text", "text": output if output is not None else f"out:{name}"}],
                     },
                 }
             )
@@ -77,7 +78,7 @@ def _pi_session_lines(
                     "timestamp": f"2026-08-02T20:0{i}:00.000Z",
                     "message": {
                         "role": "toolResult",
-                        "content": [{"type": "text", "text": f"out:{name}"}],
+                        "content": [{"type": "text", "text": output if output is not None else f"out:{name}"}],
                     },
                 }
             )
@@ -231,6 +232,27 @@ def test_ingest_entry_stores_agent_home_recording(home_tmp: Path, db_file: Path)
     assert rec.output == "out:bash"
     assert rec.exit_code == 0
     assert rec.source == "agent-home"
+
+
+def test_ingest_entry_counts_newline_terminated_output_lines(home_tmp: Path, db_file: Path) -> None:
+    _pi_session(
+        home_tmp,
+        _pi_session_lines([("bash", "printf output")], output="first\nsecond\n"),
+    )
+    conn = store.connect(db_file)
+    assert agent_ingest.ingest_entry(
+        conn,
+        atuin_id="pi-lines",
+        command="printf output",
+        author="pi",
+        exit_code=0,
+        timestamp_ns=TS0_NS,
+    ) is True
+
+    rec = store.get_recording(conn, "pi-lines")
+    assert rec is not None
+    assert rec.output_lines == ["first", "second"]
+    assert rec.total_lines == len(rec.output_lines) == 2
 
 
 def test_ingest_entry_skips_existing_and_unknown_author(home_tmp: Path, db_file: Path) -> None:

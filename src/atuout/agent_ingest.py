@@ -525,6 +525,11 @@ def match_call(index: dict[str, list[RecoveredCall]], command: str, target_ms: i
 # ---------------------------------------------------------------------------
 
 
+def _output_line_count(output: str) -> int:
+    """Return the line count used by Recording.output_lines."""
+    return len(output.splitlines())
+
+
 def ingest_entry(
     conn: sqlite3.Connection,
     *,
@@ -560,7 +565,7 @@ def ingest_entry(
         output=best.output,
         exit_code=exit_code,
         total_bytes=len(best.output.encode("utf-8")),
-        total_lines=best.output.count("\n") + 1 if best.output else 0,
+        total_lines=_output_line_count(best.output),
         captured_at_ms=best.result_ts_ms or target_ms or int(time.time() * 1000),
         source="agent-home",
     )
@@ -646,7 +651,7 @@ def backfill(
             output=best.output,
             exit_code=row["exit"],
             total_bytes=len(best.output.encode("utf-8")),
-            total_lines=best.output.count("\n") + 1 if best.output else 0,
+            total_lines=_output_line_count(best.output),
             captured_at_ms=best.result_ts_ms or target_ms or int(time.time() * 1000),
             source="agent-home",
         )
