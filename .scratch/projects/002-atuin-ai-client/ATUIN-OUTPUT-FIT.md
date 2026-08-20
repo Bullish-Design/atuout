@@ -1,6 +1,7 @@
 # `atuin_output` against atuout's store — fit analysis
 
-**Status:** analysis only, no code written
+**Status:** shared range resolver and renderer implemented; no MCP or Atuin
+tool transport yet
 **Date:** 2026-08-20
 **Inputs:** `PROTOCOL-NOTES.md`; `src/atuout/store.py`, `src/atuout/recording.py`,
 `src/atuout/agent_ingest.py`, `src/atuout/harvest.py`
@@ -102,33 +103,31 @@ Concretely, for a resolved half-open `[lo, hi)`:
 "\n".join(f"{i + 1}\t{lines[i]}" for i in range(lo, hi))
 ```
 
-## `total_lines` disagrees with `output_lines` — do not use it for indexing
+## `total_lines` must not control range indexing
 
 `recordings.total_lines` is populated differently per source:
 
 - `harvest.py:77` — `reply.total_lines`, straight from the daemon.
-- `agent_ingest.py:440` and `:516` — `output.count("\n") + 1 if output else 0`.
+- `agent_ingest.py` — `len(output.splitlines())`.
 
-`Recording.output_lines` uses `str.splitlines()`. For any output ending in a
-newline — which is nearly all command output — the agent-home computation is
-**one higher** than `len(output_lines)`:
+`Recording.output_lines` uses `str.splitlines()`. The agent-home path used to
+compute a different count for newline-terminated output:
 
 | Output | `count("\n") + 1` | `len(splitlines())` |
 | --- | --- | --- |
 | `"a\nb\n"` | 3 | 2 |
 | `"a\nb"` | 2 | 2 |
 
-So for `source="agent-home"` records, `total_lines` is systematically off by
-one. Resolving `[-1, -1]` against `total_lines` would return an empty range or
-the wrong line.
+Commit `3d5738b` fixed the agent-home path and added a regression test. The
+daemon count remains a transport value, so it can still differ from the local
+line representation.
 
 **Rule: resolve negative indices against `len(recording.output_lines)`.** Treat
 `total_lines` as a display statistic only. Whether the daemon's `total_lines`
 agrees with `splitlines()` is unverified and does not matter if the rule holds.
 
-This is a pre-existing inconsistency in atuout, not something the tool
-introduces. It is only latent today because nothing indexes by line. Worth
-fixing at the source regardless; the two paths should agree.
+This was a pre-existing inconsistency in atuout, not something the tool
+introduced. The resolver correctly uses the local output representation.
 
 ## Gaps the protocol does not specify
 
@@ -195,12 +194,7 @@ and never as instruction.
 ## Assessment
 
 The contract fits atuout's existing schema with no migration and no new
-capture work. The real content is three things, none of them large:
-
-1. a correct inclusive/exclusive range resolver (written and checked above);
-2. absolute 1-based rendering, plus a byte cap and truncation notice;
-3. deciding the multi-range separator, which needs a look at Atuin's own client.
-
-The one genuine defect this surfaced is atuout's own: `total_lines` disagrees
-with `len(output_lines)` for `agent-home` records. That is worth fixing
-independently of whether either delivery path gets built.
+capture work. The shared resolver now implements inclusive range conversion,
+the ten-range limit, absolute 1-based rendering, and an explicit omission
+marker between non-contiguous ranges. The byte cap and tool transports remain
+next work.
