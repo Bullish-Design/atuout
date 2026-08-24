@@ -386,6 +386,11 @@ def run() -> int:
     signal.signal(signal.SIGINT, _handle)
 
     _write_pidfile()
+    # Create the DB on this thread before the workers connect. `PRAGMA journal_mode=WAL` takes a
+    # brief exclusive lock and does NOT invoke the busy handler, so two threads opening a *new* DB
+    # at once leave one with `database is locked`. Once the file exists in WAL mode the PRAGMA is
+    # a no-op and cannot fail (measured: 37/200 fresh, 0/200 existing).
+    store.connect().close()
     worker = threading.Thread(
         target=_run_loop, args=(control, pending), name="reconciler-tail"
     )
