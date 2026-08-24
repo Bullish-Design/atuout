@@ -50,6 +50,26 @@ in
     echo hello from $GREET
   '';
 
+  # devman — the automation plane (CONCEPT.md §5). `base` alone: this repository
+  # ships no scheduled work and writes none of its own files.
+  devman = {
+    enable = true;
+    project = "atuout";
+    groups = [ "base" ];
+  };
+
+  # https://devenv.sh/tasks/
+  #
+  # The two task names the `base` group calls (groups/base/README.md). devenv
+  # owns each implementation; Dagu owns the composition (§6).
+  tasks = {
+    "atuout:lint".exec = "uv run ruff check src tests";
+    "atuout:test".exec = "uv run pytest";
+
+    "base:check".after = [ "atuout:lint" ];
+    "base:test".after = [ "atuout:test" ];
+  };
+
   enterShell = ''
     hello
     git --version
