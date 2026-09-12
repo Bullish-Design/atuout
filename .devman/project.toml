@@ -1,0 +1,4 @@
+schema = 1
+project = "atuout"
+groups = ["base"]
+policy = "stable"
