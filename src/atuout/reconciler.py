@@ -45,6 +45,7 @@ AGENT_RETRY_DELAYS_S = (2.0, 5.0, 15.0, 60.0, 300.0)
 # output. Catches whatever the retry queue lost to a restart or a long stall.
 AGENT_SWEEP_INTERVAL_S = 900.0
 AGENT_SWEEP_LOOKBACK_S = 6 * 3600.0
+AGENT_RETRY_QUEUE_MAX = 4096
 
 
 def pidfile_path() -> Path:
@@ -128,14 +129,17 @@ class _AgentRetryQueue:
         self,
         delays: tuple[float, ...] = AGENT_RETRY_DELAYS_S,
         now: Callable[[], float] = time.monotonic,
+        max_items: int = AGENT_RETRY_QUEUE_MAX,
     ) -> None:
         self._delays = delays
         self._now = now
+        self._max_items = max_items
         self._lock = threading.Lock()
-        self._items: list[_PendingAgent] = []
+        self._items: dict[str, _PendingAgent] = {}
         self.wakeup = threading.Event()
 
-    def add(self, entry: history_pb2.HistoryEntry) -> None:
+    def add(self, entry: history_pb2.HistoryEntry) -> bool:
+        """Add an entry once, returning False for duplicates or a full queue."""
         pending = _PendingAgent(
             atuin_id=entry.id,
             command=entry.command,
@@ -145,16 +149,21 @@ class _AgentRetryQueue:
             due_at=self._now() + self._delays[0],
         )
         with self._lock:
-            self._items.append(pending)
+            if entry.id in self._items:
+                return False
+            if len(self._items) >= self._max_items:
+                return False
+            self._items[entry.id] = pending
         self.wakeup.set()
+        return True
 
     def take_due(self) -> list[_PendingAgent]:
         """Remove and return every entry whose retry time has arrived."""
         now = self._now()
         with self._lock:
-            due = [item for item in self._items if item.due_at <= now]
-            if due:
-                self._items = [item for item in self._items if item.due_at > now]
+            due = [item for item in self._items.values() if item.due_at <= now]
+            for item in due:
+                self._items.pop(item.atuin_id, None)
         return due
 
     def requeue(self, pending: _PendingAgent) -> bool:
@@ -164,7 +173,9 @@ class _AgentRetryQueue:
             return False
         pending.due_at = self._now() + self._delays[pending.attempt]
         with self._lock:
-            self._items.append(pending)
+            if pending.atuin_id in self._items or len(self._items) >= self._max_items:
+                return False
+            self._items[pending.atuin_id] = pending
         return True
 
     def next_delay(self, default: float) -> float:
@@ -172,7 +183,7 @@ class _AgentRetryQueue:
         with self._lock:
             if not self._items:
                 return default
-            soonest = min(item.due_at for item in self._items)
+            soonest = min(item.due_at for item in self._items.values())
         return max(0.0, min(default, soonest - self._now()))
 
     def __len__(self) -> int:
@@ -189,6 +200,7 @@ def reconcile_ended(
     delay_ms: int = RECONCILE_DELAY_MS,
     sleep: Callable[[float], object] = time.sleep,
     pending: _AgentRetryQueue | None = None,
+    agent_index: agent_ingest.TranscriptIndex | None = None,
 ) -> bool:
     """Backfill the capture for one ENDED history entry if missing. Returns True if stored."""
     log = get_logger()
@@ -200,6 +212,12 @@ def reconcile_ended(
     # instead. The agent writes that transcript after the hook fires, so a miss
     # here is expected — hand the entry to the retry queue rather than drop it.
     if entry.author in AGENT_AUTHORS:
+        if pending is not None:
+            # The tail thread only enqueues. Transcript discovery and parsing
+            # run on the retry worker so a large session can never stall the
+            # live Atuin history stream.
+            pending.add(entry)
+            return False
         stored = ingest_entry(
             conn,
             atuin_id=entry.id,
@@ -207,6 +225,7 @@ def reconcile_ended(
             author=entry.author,
             exit_code=entry.exit,
             timestamp_ns=entry.timestamp,
+            index=agent_index,
         )
         if not stored and pending is not None:
             pending.add(entry)
@@ -268,21 +287,37 @@ class _Control:
                     self._call.cancel()
 
 
-def drain_agent_retries(conn: sqlite3.Connection, pending: _AgentRetryQueue) -> int:
+def drain_agent_retries(
+    conn: sqlite3.Connection,
+    pending: _AgentRetryQueue,
+    agent_index: agent_ingest.TranscriptIndex | None = None,
+) -> int:
     """Re-check every due agent entry. Returns how many stored this pass."""
     log = get_logger()
+    due = pending.take_due()
+    if not due:
+        return 0
+    if agent_index is None:
+        agent_index = agent_ingest.TranscriptIndex(tuple(sorted({item.author for item in due})))
+    agent_index.refresh(min_timestamp_ms=min(item.timestamp_ns for item in due) // 1_000_000)
     stored = 0
-    for item in pending.take_due():
-        if store.has_recording(conn, item.atuin_id):
+    for item in due:
+        try:
+            if store.has_recording(conn, item.atuin_id):
+                continue
+            ok = ingest_entry(
+                conn,
+                atuin_id=item.atuin_id,
+                command=item.command,
+                author=item.author,
+                exit_code=item.exit_code,
+                timestamp_ns=item.timestamp_ns,
+                index=agent_index,
+            )
+        except Exception as e:  # isolate one bad transcript or DB operation
+            log.error("reconciler: agent entry %s failed: %s", item.atuin_id, e)
+            pending.requeue(item)
             continue
-        ok = ingest_entry(
-            conn,
-            atuin_id=item.atuin_id,
-            command=item.command,
-            author=item.author,
-            exit_code=item.exit_code,
-            timestamp_ns=item.timestamp_ns,
-        )
         if ok:
             stored += 1
             log.info("reconcile %s: stored from %s transcript", item.atuin_id, item.author)
@@ -304,6 +339,7 @@ def _agent_retry_loop(control: _Control, pending: _AgentRetryQueue) -> None:
     """
     log = get_logger()
     conn = store.connect()  # sqlite connections are thread-affine
+    agent_index = agent_ingest.TranscriptIndex()
     next_sweep = time.monotonic() + AGENT_SWEEP_INTERVAL_S
 
     while not control.stop.is_set():
@@ -313,7 +349,20 @@ def _agent_retry_loop(control: _Control, pending: _AgentRetryQueue) -> None:
         if control.stop.is_set():
             return
         try:
-            drain_agent_retries(conn, pending)
+            drain_agent_retries(conn, pending, agent_index)
+            stats = agent_index.last_stats
+            if stats.reparsed or stats.evicted or stats.errors:
+                log.info(
+                    "reconciler: transcript index discovered=%d reparsed=%d reused=%d "
+                    "evicted=%d errors=%d files=%d calls=%d",
+                    stats.discovered,
+                    stats.reparsed,
+                    stats.reused,
+                    stats.evicted,
+                    stats.errors,
+                    agent_index.file_count,
+                    agent_index.call_count,
+                )
         except Exception as e:  # a bad transcript must not kill the worker
             log.error("reconciler: agent retry failed: %s", e)
 
@@ -321,7 +370,7 @@ def _agent_retry_loop(control: _Control, pending: _AgentRetryQueue) -> None:
             next_sweep = time.monotonic() + AGENT_SWEEP_INTERVAL_S
             try:
                 since_ms = int((time.time() - AGENT_SWEEP_LOOKBACK_S) * 1000)
-                found = agent_ingest.backfill(conn, since_ms=since_ms)
+                found = agent_ingest.backfill(conn, since_ms=since_ms, index=agent_index)
                 if found:
                     log.info("reconciler: sweep recovered %d agent command(s)", found)
             except Exception as e:

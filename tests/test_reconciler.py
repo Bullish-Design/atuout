@@ -138,6 +138,14 @@ def test_agent_queue_next_delay_tracks_soonest() -> None:
     assert q.next_delay(5.0) == 5.0  # never longer than the cap
 
 
+def test_agent_queue_deduplicates_and_is_bounded() -> None:
+    q = reconciler._AgentRetryQueue(delays=(1.0,), max_items=1)
+    assert q.add(_agent_entry("same")) is True
+    assert q.add(_agent_entry("same")) is False
+    assert q.add(_agent_entry("other")) is False
+    assert len(q) == 1
+
+
 def test_reconcile_ended_enqueues_agent_miss(fake_daemon: FakeDaemon, db_file: Path, tmp_path, monkeypatch) -> None:
     """An agent entry with no transcript match goes to the retry queue, not the floor."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))

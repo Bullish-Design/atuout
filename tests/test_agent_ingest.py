@@ -273,7 +273,7 @@ def test_backfill_from_history_and_sessions(home_tmp: Path, db_file: Path, data_
 
 
 def test_reconcile_ended_ingests_agent_entry(home_tmp: Path, db_file: Path) -> None:
-    """The reconciler routes agent-authored ENDED events to the transcript ingester."""
+    """The reconciler queues agent work so the history tail stays responsive."""
     from atuout import reconciler
     from atuout._proto import history_pb2
 
@@ -282,9 +282,11 @@ def test_reconcile_ended_ingests_agent_entry(home_tmp: Path, db_file: Path) -> N
     entry = history_pb2.HistoryEntry(
         id="agent1", command="echo agent-cmd", author="pi", exit=0, timestamp=TS0_NS
     )
-    # The daemon has no capture for it; the ingester recovers from the transcript.
-    stored = reconciler.reconcile_ended(conn, None, entry, attempts=2, delay_ms=1)
-    assert stored is True
+    pending = reconciler._AgentRetryQueue(delays=(0.0,))
+    # The daemon has no capture for it; the worker recovers from the transcript.
+    stored = reconciler.reconcile_ended(conn, None, entry, pending=pending)
+    assert stored is False
+    assert reconciler.drain_agent_retries(conn, pending) == 1
     rec = store.get_recording(conn, "agent1")
     assert rec is not None and rec.output == "out:bash" and rec.source == "agent-home"
 
@@ -463,6 +465,78 @@ def test_backfill_since_ms_bounds_the_scan(home_tmp: Path, db_file: Path, data_h
     cutoff_ms = TS0_MS + 3_600_000
     assert agent_ingest.backfill(conn, since_ms=cutoff_ms) == 0
     assert agent_ingest.backfill(conn, since_ms=TS0_MS - 3_600_000) == 1
+
+
+def test_transcript_index_reuses_unchanged_files_and_refreshes_changes(home_tmp: Path) -> None:
+    path = _pi_session(home_tmp, _pi_session_lines([("bash", "echo indexed")]))
+    original = agent_ingest._PARSERS["pi"]
+    parses = 0
+
+    def counting_parser(candidate: Path) -> list[agent_ingest.RecoveredCall]:
+        nonlocal parses
+        parses += 1
+        return original(candidate)
+
+    agent_ingest._PARSERS["pi"] = counting_parser
+    try:
+        index = agent_ingest.TranscriptIndex(("pi",), refresh_interval_s=0)
+        index.refresh(force=True)
+        index.refresh(force=True)
+        assert parses == 1
+        assert index.last_stats.reused == 1
+
+        with path.open("a") as fh:
+            fh.write(json.dumps(_pi_session_lines([("bash", "echo new")])[0]) + "\n")
+        index.refresh(force=True)
+        assert parses == 2
+
+        new_path = path.with_name("new.jsonl")
+        _write_jsonl(new_path, _pi_session_lines([("bash", "echo another")]))
+        index.refresh(force=True)
+        assert parses == 3
+    finally:
+        agent_ingest._PARSERS["pi"] = original
+
+
+def test_transcript_index_handles_partial_jsonl_and_bounds_files(home_tmp: Path) -> None:
+    path = home_tmp / ".pi" / "agent" / "sessions" / "--home--" / "partial.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"type":"message"}\n{"incomplete":')
+    index = agent_ingest.TranscriptIndex(("pi",), refresh_interval_s=0, max_files=1)
+    index.refresh(force=True)
+    assert index.call_count == 0
+    with path.open("a") as fh:
+        fh.write(" null}\n")
+    index.refresh(force=True)
+    assert index.file_count == 1
+    assert index.call_count == 0
+
+
+def test_ingest_reuses_worker_index_for_multiple_events(home_tmp: Path, db_file: Path) -> None:
+    _pi_session(home_tmp, _pi_session_lines([("bash", "echo reusable")]))
+    conn = store.connect(db_file)
+    index = agent_ingest.TranscriptIndex(("pi",), refresh_interval_s=0)
+    original = agent_ingest._PARSERS["pi"]
+    parses = 0
+
+    def counting_parser(path: Path) -> list[agent_ingest.RecoveredCall]:
+        nonlocal parses
+        parses += 1
+        return original(path)
+
+    agent_ingest._PARSERS["pi"] = counting_parser
+    try:
+        assert agent_ingest.ingest_entry(
+            conn, atuin_id="reuse-1", command="echo reusable", author="pi", exit_code=0,
+            timestamp_ns=TS0_NS, index=index,
+        )
+        assert agent_ingest.ingest_entry(
+            conn, atuin_id="reuse-2", command="echo reusable", author="pi", exit_code=0,
+            timestamp_ns=TS0_NS, index=index,
+        )
+        assert parses == 1
+    finally:
+        agent_ingest._PARSERS["pi"] = original
 
 
 # ---------------------------------------------------------------------------

@@ -34,9 +34,10 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from atuout import store
 
@@ -50,6 +51,16 @@ _MATCH_WINDOW_MS = 60_000
 # writing right now. Parse transcripts touched within this window of the
 # entry's timestamp; older ones cannot hold the call we want.
 _LIVE_TRANSCRIPT_SLACK_S = 300.0
+
+# Live ingestion is deliberately a small, rolling cache.  A command that has
+# not appeared in the last ten minutes cannot match a live ENDED event (the
+# retry schedule is five minutes and matching itself is one minute wide).
+_LIVE_INDEX_REFRESH_S = 1.0
+_LIVE_INDEX_RETENTION_S = 10 * 60.0
+_LIVE_INDEX_MAX_FILES = 512
+_LIVE_INDEX_MAX_CALLS_PER_FILE = 4096
+
+_direct_indexes: dict[str, TranscriptIndex] = {}
 
 
 @dataclass
@@ -160,7 +171,8 @@ def parse_codex_session(path: Path) -> list[RecoveredCall]:
             if command:
                 commands[call_id] = (command, _ts_millis(event.get("timestamp")))
         elif ptype == "custom_tool_call" and payload.get("name") == "exec":
-            found = _codex_script_commands(payload.get("input") or "")
+            raw_input = payload.get("input")
+            found = _codex_script_commands(raw_input if isinstance(raw_input, str) else "")
             if len(found) == 1:
                 commands[call_id] = (found[0], _ts_millis(event.get("timestamp")))
         elif ptype in ("function_call_output", "custom_tool_call_output"):
@@ -251,11 +263,12 @@ def _codex_output_text(output: object) -> str:
         return output
     if not isinstance(output, list):
         return ""
-    texts = [
-        block["text"]
-        for block in output
-        if isinstance(block, dict) and isinstance(block.get("text"), str)
-    ]
+    texts: list[str] = []
+    for block in output:
+        if isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str):
+                texts.append(text)
     if texts and _CODEX_HEADER_RE.match(texts[0]):
         texts = texts[1:]
     return "\n".join(texts)
@@ -266,14 +279,17 @@ def _claude_result_text(content: object) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = [
-            block.get("text", "")
-            for block in content
-            if isinstance(block, dict) and isinstance(block.get("text"), str)
-        ]
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
         return "\n".join(parts)
-    if isinstance(content, dict) and isinstance(content.get("text"), str):
-        return content["text"]
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
     return ""
 
 
@@ -322,25 +338,138 @@ def iter_session_files(author: str, *, modified_since_s: float | None = None) ->
         yield path
 
 
-# Parsed transcripts, keyed by path and invalidated on (mtime, size). Only the
-# live path caches, and only over a short mtime window, so this holds the few
-# sessions currently being written — not every transcript on disk.
-_parse_cache: dict[Path, tuple[float, int, list[RecoveredCall]]] = {}
+@dataclass
+class RefreshStats:
+    """Counters from one live-index refresh, useful for diagnostics and tests."""
+
+    discovered: int = 0
+    reparsed: int = 0
+    reused: int = 0
+    evicted: int = 0
+    errors: int = 0
 
 
-def _parse_cached(
-    parser: Callable[[Path], list[RecoveredCall]], path: Path
-) -> list[RecoveredCall]:
-    try:
-        stat = path.stat()
-    except OSError:
-        return []
-    cached = _parse_cache.get(path)
-    if cached is not None and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-        return cached[2]
-    calls = parser(path)
-    _parse_cache[path] = (stat.st_mtime, stat.st_size, calls)
-    return calls
+@dataclass
+class _IndexedFile:
+    mtime_ns: int
+    size: int
+    calls: list[RecoveredCall] = field(default_factory=list)
+
+
+class TranscriptIndex:
+    """Reusable, bounded index for transcripts used by the live reconciler.
+
+    Discovery is throttled, unchanged files are not opened, and only the most
+    recent files/calls are retained.  A file being appended to is reparsed on
+    its next refresh because both size and nanosecond mtime are part of its
+    identity.  Parsing failures are isolated to that file and never escape to
+    the tail loop.
+    """
+
+    def __init__(
+        self,
+        authors: tuple[str, ...] = AGENT_AUTHORS,
+        *,
+        refresh_interval_s: float = _LIVE_INDEX_REFRESH_S,
+        retention_s: float = _LIVE_INDEX_RETENTION_S,
+        max_files: int = _LIVE_INDEX_MAX_FILES,
+        max_calls_per_file: int = _LIVE_INDEX_MAX_CALLS_PER_FILE,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.authors = authors
+        self.refresh_interval_s = refresh_interval_s
+        self.retention_s = retention_s
+        self.max_files = max_files
+        self.max_calls_per_file = max_calls_per_file
+        self._clock = clock
+        self._last_refresh = float("-inf")
+        self._files: dict[Path, _IndexedFile] = {}
+        self._index: dict[str, list[RecoveredCall]] = {}
+        self.last_stats = RefreshStats()
+
+    @property
+    def file_count(self) -> int:
+        return len(self._files)
+
+    @property
+    def call_count(self) -> int:
+        return sum(len(calls) for calls in self._index.values())
+
+    def refresh(
+        self,
+        *,
+        min_timestamp_ms: int | None = None,
+        force: bool = False,
+    ) -> RefreshStats:
+        """Refresh changed/new live files, unless the refresh interval has not elapsed."""
+        now = self._clock()
+        if not force and now - self._last_refresh < self.refresh_interval_s:
+            self.last_stats = RefreshStats()
+            return self.last_stats
+        self._last_refresh = now
+        stats = RefreshStats()
+        cutoff = now - self.retention_s
+        if min_timestamp_ms is not None:
+            cutoff = min(cutoff, min_timestamp_ms / 1000.0 - _LIVE_TRANSCRIPT_SLACK_S)
+
+        candidates: list[tuple[int, Path]] = []
+        seen: set[Path] = set()
+        for author in self.authors:
+            for path in iter_session_files(author):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if stat.st_mtime < cutoff:
+                    continue
+                candidates.append((stat.st_mtime_ns, path))
+                seen.add(path)
+        candidates.sort(reverse=True)
+        candidates = candidates[: self.max_files]
+        stats.discovered = len(candidates)
+
+        for _mtime_ns, path in candidates:
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            cached = self._files.get(path)
+            if cached is not None and (cached.mtime_ns, cached.size) == (stat.st_mtime_ns, stat.st_size):
+                stats.reused += 1
+                continue
+            author = next((a for a in self.authors if path.is_relative_to(_agent_home(a) or path)), None)
+            parser = _PARSERS.get(author or "")
+            if parser is None:
+                continue
+            try:
+                calls = parser(path)
+                # The newest calls are the only calls relevant to the live path.
+                calls = calls[-self.max_calls_per_file :]
+            except Exception:
+                # A malformed shape in one vendor's evolving transcript
+                # format must not abort refreshes for every other session.
+                stats.errors += 1
+                calls = []
+            self._files[path] = _IndexedFile(stat.st_mtime_ns, stat.st_size, calls)
+            stats.reparsed += 1
+
+        keep = {path for _mtime, path in candidates}
+        for path in list(self._files):
+            if path not in keep or path not in seen:
+                del self._files[path]
+                stats.evicted += 1
+        self._rebuild_index()
+        self.last_stats = stats
+        return stats
+
+    def _rebuild_index(self) -> None:
+        self._index = {}
+        for state in self._files.values():
+            for call in state.calls:
+                self._index.setdefault(call.command.rstrip(), []).append(call)
+
+    def match(self, command: str, target_ms: int | None) -> RecoveredCall | None:
+        return match_call(self._index, command, target_ms)
 
 
 def build_index(
@@ -360,24 +489,14 @@ def build_index(
         parser = _PARSERS.get(author)
         if parser is None:
             continue
-        scanned: set[Path] = set()
         for path in iter_session_files(author, modified_since_s=modified_since_s):
-            scanned.add(path)
-            calls = _parse_cached(parser, path) if use_cache else parser(path)
+            # ``use_cache`` is retained for API compatibility.  Live callers
+            # use TranscriptIndex; one-shot backfills should not retain an
+            # unbounded process-global cache.
+            calls = parser(path)
             for call in calls:
                 index.setdefault(call.command.rstrip(), []).append(call)
-        if use_cache:
-            _evict_outside(author, scanned)
     return index
-
-
-def _evict_outside(author: str, keep: set[Path]) -> None:
-    """Drop cached parses for ``author`` that the latest scan did not cover."""
-    base = _agent_home(author)
-    if base is None:
-        return
-    for path in [p for p in _parse_cache if p not in keep and p.is_relative_to(base)]:
-        del _parse_cache[path]
 
 
 def match_call(index: dict[str, list[RecoveredCall]], command: str, target_ms: int | None) -> RecoveredCall | None:
@@ -394,8 +513,8 @@ def match_call(index: dict[str, list[RecoveredCall]], command: str, target_ms: i
     ]
     timed = [s for s in scored if s[0] is not None]
     if timed:
-        best_delta, best = min(timed, key=lambda s: s[0])
-        if target_ms and best_delta > _MATCH_WINDOW_MS:
+        best_delta, best = min(timed, key=lambda s: s[0] or 0)
+        if target_ms and best_delta is not None and best_delta > _MATCH_WINDOW_MS:
             return None
         return best
     return candidates[0]  # no timestamps anywhere; accept the first
@@ -414,6 +533,7 @@ def ingest_entry(
     author: str,
     exit_code: int | None,
     timestamp_ns: int | None,
+    index: TranscriptIndex | None = None,
 ) -> bool:
     """Recover one agent-run command's output and store it. True if stored."""
     if store.has_recording(conn, atuin_id):
@@ -424,9 +544,12 @@ def ingest_entry(
     # The agent appends the result to its transcript *after* the shell hook
     # records the command, so the file we want was written at or after
     # ``target_ms``. Scanning only that window keeps the live path cheap.
-    since_s = (target_ms / 1000.0) - _LIVE_TRANSCRIPT_SLACK_S if target_ms else None
-    index = build_index((author,), modified_since_s=since_s, use_cache=True)
-    best = match_call(index, command, target_ms)
+    if index is None:
+        # Direct/CLI users do not have a reconciler-owned worker. Keep a small
+        # reusable index for them too, keyed by the current HOME-derived roots.
+        index = _direct_indexes.setdefault(author, TranscriptIndex((author,)))
+    index.refresh(min_timestamp_ms=target_ms)
+    best = index.match(command, target_ms)
     if best is None:
         return False
 
@@ -457,6 +580,7 @@ def backfill(
     limit: int | None = None,
     since_ms: int | None = None,
     dry_run: bool = False,
+    index: TranscriptIndex | None = None,
 ) -> int:
     """Scan atuin history for agent-authored entries missing recordings and ingest them.
 
@@ -494,7 +618,12 @@ def backfill(
         src.close()
 
     since_s = (since_ms / 1000.0) - _LIVE_TRANSCRIPT_SLACK_S if since_ms is not None else None
-    index = build_index(authors, modified_since_s=since_s, use_cache=since_ms is not None)
+    lookup_index: dict[str, list[RecoveredCall]] | TranscriptIndex
+    if index is None:
+        lookup_index = build_index(authors, modified_since_s=since_s, use_cache=since_ms is not None)
+    else:
+        index.refresh(min_timestamp_ms=since_ms, force=True)
+        lookup_index = index
     ingested = 0
     for row in rows:
         if store.has_recording(conn, row["id"]):
@@ -503,7 +632,11 @@ def backfill(
             ingested += 1
             continue
         target_ms = (row["timestamp"] or 0) // 1_000_000
-        best = match_call(index, row["command"] or "", target_ms)
+        best = (
+            lookup_index.match(row["command"] or "", target_ms)
+            if isinstance(lookup_index, TranscriptIndex)
+            else match_call(lookup_index, row["command"] or "", target_ms)
+        )
         if best is None:
             continue
         store.upsert_recording(
@@ -521,7 +654,7 @@ def backfill(
     return ingested
 
 
-def _iter_json(path: Path) -> Iterator[dict]:
+def _iter_json(path: Path) -> Iterator[dict[str, Any]]:
     """Yield parsed JSON objects from a JSONL file, skipping bad lines."""
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
@@ -536,7 +669,7 @@ def _iter_json(path: Path) -> Iterator[dict]:
         return
 
 
-def _join_text(parts: list[dict]) -> str:
+def _join_text(parts: list[dict[str, Any]]) -> str:
     return "".join(p.get("text", "") for p in parts if isinstance(p.get("text"), str))
 
 
