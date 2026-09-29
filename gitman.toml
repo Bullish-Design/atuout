@@ -1,1 +1,3 @@
 trunk = "main"
+verify = ["bash", "-c", "uv run --no-project --with-editable '.[dev]' bash -c 'ruff check src tests && ty check && pytest'"]
+verify_timeout = 1800
