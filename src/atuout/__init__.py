@@ -1,4 +1,4 @@
-"""Atuout — harvester that archives Atuin's native command-output captures."""
+"""Atuout — store and importer for agent command output linked to Atuin history."""
 
 from atuout.recording import Recording
 

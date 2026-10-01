@@ -1,21 +1,4 @@
-{ pkgs, lib, config, inputs, ... }:
-
-let
-  # atuin main requires rustc >= 1.97; build it with a current stable toolchain from
-  # rust-overlay rather than the pinned nixpkgs' older rustc.
-  rustPkgs = import inputs.nixpkgs {
-    inherit (pkgs) system;
-    overlays = [ (import inputs.rust-overlay) ];
-  };
-  rustToolchain = rustPkgs.rust-bin.stable.latest.default;
-  rustPlatform = rustPkgs.makeRustPlatform {
-    cargo = rustToolchain;
-    rustc = rustToolchain;
-  };
-  # Build atuin from the pinned source (atuin.nix), so we get PR #3510's Semantic
-  # capture service that released atuin lacks. Cached after the first build.
-  atuinLatest = pkgs.callPackage "${inputs.atuin-src}/atuin.nix" { inherit rustPlatform; };
-in
+{ pkgs, config, ... }:
 {
   # https://devenv.sh/basics/
   env.GREET = "atuout";
@@ -25,15 +8,7 @@ in
     pkgs.git
     pkgs.uv
     pkgs.jq
-    atuinLatest  # atuin built from source w/ PR #3510 — integration test needs the Semantic service
     ];
-
-  # grpcio ships a C extension that dlopen's libstdc++ at import time; expose it
-  # (and zlib, needed by grpcio-tools' protoc) so imports work in the venv.
-  env.LD_LIBRARY_PATH = lib.makeLibraryPath [
-    pkgs.stdenv.cc.cc.lib
-    pkgs.zlib
-  ];
 
   # https://devenv.sh/languages/
   languages = {

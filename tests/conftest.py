@@ -1,25 +1,12 @@
-"""Shared fixtures: env isolation, temp DB, and the fake atuin daemon."""
+"""Shared fixtures for environment isolation and temporary SQLite stores."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from tests.support.atuin_daemon import spawn_atuin_daemon
-from tests.support.fake_daemon import FakeDaemon
-
-_ATUOUT_ENV = (
-    "ATUOUT_DAEMON_SOCKET",
-    "ATUOUT_DB_PATH",
-    "ATUOUT_DATA_DIR",
-    "ATUOUT_STATE_DIR",
-    "ATUOUT_HARVEST_ATTEMPTS",
-    "ATUOUT_HARVEST_DELAY_MS",
-    "ATUIN_CONFIG_DIR",
-    "XDG_RUNTIME_DIR",
-)
+_ATUOUT_ENV = ("ATUOUT_DB_PATH", "ATUOUT_DATA_DIR")
 
 
 @pytest.fixture(autouse=True)
@@ -27,40 +14,8 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for var in _ATUOUT_ENV:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("ATUOUT_DB_PATH", str(tmp_path / "atuout.db"))
-    monkeypatch.setenv("ATUOUT_STATE_DIR", str(tmp_path / "state"))
-    # Point at a nonexistent socket by default so probes are deterministically "unreachable"
-    # and never touch a real atuin daemon; fixtures that need one override this.
-    monkeypatch.setenv("ATUOUT_DAEMON_SOCKET", str(tmp_path / "no-daemon.sock"))
-
-
-@pytest.fixture
-def atuin_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    """A real ``atuin daemon`` under a temp HOME; yields its socket path.
-
-    Shared by the live integration suites (``test_integration_daemon`` and
-    ``test_integration_pty_proxy``). Skips when the daemon can't create its socket.
-    """
-    yield from spawn_atuin_daemon(tmp_path, monkeypatch)
 
 
 @pytest.fixture
 def db_file(tmp_path: Path) -> Path:
     return tmp_path / "atuout.db"
-
-
-@pytest.fixture
-def fake_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeDaemon]:
-    socket_path = str(tmp_path / "atuin.sock")
-    monkeypatch.setenv("ATUOUT_DAEMON_SOCKET", socket_path)
-    with FakeDaemon(socket_path) as daemon:
-        yield daemon
-
-
-@pytest.fixture
-def fake_daemon_unimplemented(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[FakeDaemon]:
-    socket_path = str(tmp_path / "atuin.sock")
-    monkeypatch.setenv("ATUOUT_DAEMON_SOCKET", socket_path)
-    with FakeDaemon(socket_path, unimplemented=True) as daemon:
-        yield daemon

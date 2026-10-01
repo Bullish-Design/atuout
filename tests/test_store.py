@@ -60,12 +60,11 @@ def test_wal_mode_and_indexes_on_disk(db_file: Path) -> None:
 
 
 def test_concurrent_writers_do_not_error(db_file: Path) -> None:
-    # WAL + busy_timeout should let two independent connections (as separate processes:
-    # the fast-path harvest and the reconciler) both write without "database is locked".
+    # WAL + busy_timeout should let concurrent timer runs safely use independent connections.
     c1 = store.connect(db_file)
     c2 = store.connect(db_file)
-    assert _seed(c1, "from-harvest") is True
-    assert _seed(c2, "from-reconciler") is True
+    assert _seed(c1, "from-timer-one") is True
+    assert _seed(c2, "from-timer-two") is True
     assert store.count_recordings(store.connect(db_file)) == 2
 
 

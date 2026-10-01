@@ -1,7 +1,7 @@
 [project]
 name = "atuout"
 version = "0.2.0"
-description = "Shell command-output harvester — archives Atuin's native command captures, linked to Atuin history."
+description = "Agent command-output store and transcript importer for Atuin history."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -12,8 +12,6 @@ authors = [
 
 dependencies = [
   "pydantic>=2.12.5",
-  "grpcio>=1.60",
-  "protobuf>=4.25",
 ]
 
 [project.optional-dependencies]
@@ -22,8 +20,6 @@ dev = [
   "pytest-cov>=4.1",
   "ty>=0.0.56",
   "ruff>=0.5.0",
-  "grpcio-tools>=1.60",
-  "pexpect>=4.9",
 ]
 
 [project.scripts]
@@ -39,9 +35,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/atuout"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"shell/atuout.zsh" = "atuout/shell/atuout.zsh"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -60,25 +53,14 @@ markers = [
   "slow: spawns real processes / waits on timers (opt-in integration tests)",
 ]
 
-[tool.coverage.run]
-omit = ["src/atuout/_proto/*"]
-
 [tool.ty.environment]
 python-version = "3.13"
 # src-layout: only atuout is first-party; matches the old mypy `mypy_path`/`packages`.
 root = ["./src"]
 
-[tool.ty.analysis]
-# grpcio ships no type info; mirrors mypy's `ignore_missing_imports` override for grpc.
-# Generated _proto modules define members at runtime via `__getattr__`; treat them as Any,
-# like mypy's `follow_imports = "skip"` + `ignore_errors` override.
-replace-imports-with-any = ["grpc.**", "atuout._proto.**"]
-
 [tool.ty.src]
 # Check only the package (mypy used `packages = ["atuout"]`); leave tests to ruff/pytest.
 include = ["src"]
-# Protobuf-generated code: checked at build time by the gencode test instead.
-exclude = ["src/atuout/_proto/"]
 
 [tool.ty.rules]
 # Approximate mypy --strict for the checks ty leaves disabled by default.
@@ -89,7 +71,6 @@ possibly-unresolved-reference = "warn"
 line-length = 120
 target-version = "py313"
 src = ["src"]
-extend-exclude = ["src/atuout/_proto"]
 
 [tool.ruff.lint]
 select = [

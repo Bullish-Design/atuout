@@ -1,4 +1,4 @@
-"""SQLite-backed durable store for harvested command captures."""
+"""SQLite-backed store for output recovered from agent transcripts."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS recordings (
   total_bytes INTEGER,
   total_lines INTEGER,
   captured_at INTEGER NOT NULL,
-  source      TEXT NOT NULL DEFAULT 'fast'
+  source      TEXT NOT NULL DEFAULT 'agent-home'
 );
 
 CREATE INDEX IF NOT EXISTS idx_recordings_captured_at ON recordings(captured_at);

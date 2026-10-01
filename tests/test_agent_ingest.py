@@ -255,6 +255,37 @@ def test_ingest_entry_counts_newline_terminated_output_lines(home_tmp: Path, db_
     assert rec.total_lines == len(rec.output_lines) == 2
 
 
+def test_direct_ingest_index_is_scoped_to_agent_home(
+    home_tmp: Path, db_file: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _pi_session(home_tmp, _pi_session_lines([("bash", "echo first")], output="first home"))
+    conn = store.connect(db_file)
+    assert agent_ingest.ingest_entry(
+        conn,
+        atuin_id="home-one",
+        command="echo first",
+        author="pi",
+        exit_code=0,
+        timestamp_ns=TS0_NS,
+    ) is True
+
+    second_home = tmp_path / "second-home"
+    second_home.mkdir()
+    _pi_session(second_home, _pi_session_lines([("bash", "echo second")], output="second home"))
+    monkeypatch.setenv("HOME", str(second_home))
+    assert agent_ingest.ingest_entry(
+        conn,
+        atuin_id="home-two",
+        command="echo second",
+        author="pi",
+        exit_code=0,
+        timestamp_ns=TS0_NS,
+    ) is True
+    rec = store.get_recording(conn, "home-two")
+    assert rec is not None
+    assert rec.output == "second home"
+
+
 def test_ingest_entry_skips_existing_and_unknown_author(home_tmp: Path, db_file: Path) -> None:
     _pi_session(home_tmp, _pi_session_lines([("bash", "echo hello")]))
     conn = store.connect(db_file)
@@ -292,25 +323,6 @@ def test_backfill_from_history_and_sessions(home_tmp: Path, db_file: Path, data_
     rec = store.get_recording(conn, "h1")
     assert rec is not None and rec.output == "out:bash" and rec.source == "agent-home"
     assert store.get_recording(conn, "h2") is None
-
-
-def test_reconcile_ended_ingests_agent_entry(home_tmp: Path, db_file: Path) -> None:
-    """The reconciler queues agent work so the history tail stays responsive."""
-    from atuout import reconciler
-    from atuout._proto import history_pb2
-
-    _pi_session(home_tmp, _pi_session_lines([("bash", "echo agent-cmd")]))
-    conn = store.connect(db_file)
-    entry = history_pb2.HistoryEntry(
-        id="agent1", command="echo agent-cmd", author="pi", exit=0, timestamp=TS0_NS
-    )
-    pending = reconciler._AgentRetryQueue(delays=(0.0,))
-    # The daemon has no capture for it; the worker recovers from the transcript.
-    stored = reconciler.reconcile_ended(conn, None, entry, pending=pending)
-    assert stored is False
-    assert reconciler.drain_agent_retries(conn, pending) == 1
-    rec = store.get_recording(conn, "agent1")
-    assert rec is not None and rec.output == "out:bash" and rec.source == "agent-home"
 
 
 def test_backfill_dry_run_counts_without_storing(home_tmp: Path, db_file: Path, data_home_tmp: Path) -> None:

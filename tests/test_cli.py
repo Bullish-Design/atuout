@@ -1,5 +1,3 @@
-"""Tests for the CLI entry-point."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,89 +19,63 @@ def _seed(db: Path, atuin_id: str, output: str = "hello world\n") -> None:
         total_bytes=len(output),
         total_lines=len(output.splitlines()),
         captured_at_ms=1000,
+        source="agent-home",
     )
+    conn.close()
 
 
-class TestCLIHelp:
-    def test_no_args_prints_help(self, capsys: pytest.CaptureFixture[str]) -> None:
-        ret = main([])
-        assert ret == 0
-        assert "atuout" in capsys.readouterr().out.lower()
+def test_no_args_prints_help(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main([]) == 0
+    assert "atuout" in capsys.readouterr().out.lower()
 
 
-class TestCLIList:
-    def test_list_empty(self, db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        ret = main(["--db", str(db_file), "list"])
-        assert ret == 0
-        assert "No recordings" in capsys.readouterr().out
+def test_list_and_show_agent_recording(db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _seed(db_file, "abc")
+    assert main(["--db", str(db_file), "list"]) == 0
+    listing = capsys.readouterr().out
+    assert "Recording" in listing
+    assert "atuin=abc" in listing
 
-    def test_list_with_recordings(
-        self, db_file: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        _seed(db_file, "abc")
-        ret = main(["--db", str(db_file), "list"])
-        assert ret == 0
-        out = capsys.readouterr().out
-        assert "Recording" in out
-        assert "atuin=abc" in out
+    assert main(["--db", str(db_file), "show", "abc"]) == 0
+    assert "hello world" in capsys.readouterr().out
 
 
-class TestCLIShow:
-    def test_show_by_id(self, db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        _seed(db_file, "abc")
-        ret = main(["--db", str(db_file), "show", "abc"])
-        assert ret == 0
-        assert "hello world" in capsys.readouterr().out
-
-    def test_show_missing(self, db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        ret = main(["--db", str(db_file), "show", "nope"])
-        assert ret == 1
+def test_list_empty_store(db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--db", str(db_file), "list"]) == 0
+    assert "No agent recordings" in capsys.readouterr().out
 
 
-class TestCLIInitZsh:
-    def test_init_zsh_prints_hook(self, capsys: pytest.CaptureFixture[str]) -> None:
-        ret = main(["init-zsh"])
-        assert ret == 0
-        out = capsys.readouterr().out
-        assert "add-zsh-hook" in out
-        assert "ATUIN_PTY_PROXY_ACTIVE" in out
-        assert "atuout harvest" in out
-        assert "atuout check" in out
+def test_show_missing_recording_returns_one(db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--db", str(db_file), "show", "missing"]) == 1
+    assert "No agent recording" in capsys.readouterr().err
 
 
-class TestCLIStatus:
-    def test_status(self, db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        _seed(db_file, "abc")
-        ret = main(["--db", str(db_file), "status"])
-        assert ret == 0
-        out = capsys.readouterr().out
-        assert "daemon socket" in out
-        assert "daemon:" in out  # active probe line
-        assert "recordings:      1" in out
-
-    def test_check_silent_when_daemon_unreachable(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        # Default fixture points at a nonexistent socket → unreachable → no warning, exit 0.
-        ret = main(["check"])
-        assert ret == 0
-        assert capsys.readouterr().err == ""
-
-    def test_check_warns_when_capture_unsupported(
-        self, fake_daemon_unimplemented, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        ret = main(["check"])
-        assert ret == 0
-        assert "command-output capture" in capsys.readouterr().err
-
-    def test_reconcile_status(self, capsys: pytest.CaptureFixture[str]) -> None:
-        ret = main(["reconcile", "status"])
-        assert ret == 0
-        assert "reconciler:" in capsys.readouterr().out
+def test_status_reports_agent_store(db_file: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _seed(db_file, "abc")
+    assert main(["--db", str(db_file), "status"]) == 0
+    output = capsys.readouterr().out
+    assert f"agent store: {db_file}" in output
+    assert "agent recordings: 1" in output
 
 
-class TestCLIRecordRemoved:
-    def test_record_subcommand_gone(self) -> None:
-        with pytest.raises(SystemExit) as exc:
-            main(["record", "echo hi"])
-        assert exc.value.code != 0
+def test_ingest_agent_calls_backfill(db_file: Path, monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from atuout import agent_ingest
+
+    calls = []
+
+    def backfill(conn, **kwargs):
+        calls.append(kwargs)
+        return 2
+
+    monkeypatch.setattr(agent_ingest, "backfill", backfill)
+    assert main(["--db", str(db_file), "ingest-agent", "--agent", "codex", "--since-hours", "6"]) == 0
+    assert calls[0]["authors"] == ("codex",)
+    assert calls[0]["since_ms"] is not None
+    assert "ingested 2 agent commands" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("subcommand", ["harvest", "reconcile", "init-zsh", "check"])
+def test_dead_harvest_commands_are_removed(subcommand: str) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main([subcommand])
+    assert exc.value.code != 0

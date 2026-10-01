@@ -47,9 +47,8 @@ AGENT_AUTHORS = ("pi", "claude-code", "codex")
 # timestamp for us to consider it a match, when the command text matches.
 _MATCH_WINDOW_MS = 60_000
 
-# The live path (reconciler) only ever needs the session file the agent is
-# writing right now. Parse transcripts touched within this window of the
-# entry's timestamp; older ones cannot hold the call we want.
+# Transcript files may be written shortly after Atuin records their history
+# row. Include a small mtime margin when a bounded backfill scans them.
 _LIVE_TRANSCRIPT_SLACK_S = 300.0
 
 # Live ingestion is deliberately a small, rolling cache.  A command that has
@@ -60,7 +59,7 @@ _LIVE_INDEX_RETENTION_S = 10 * 60.0
 _LIVE_INDEX_MAX_FILES = 512
 _LIVE_INDEX_MAX_CALLS_PER_FILE = 4096
 
-_direct_indexes: dict[str, TranscriptIndex] = {}
+_direct_indexes: dict[tuple[str, Path], TranscriptIndex] = {}
 
 
 @dataclass
@@ -357,7 +356,7 @@ class _IndexedFile:
 
 
 class TranscriptIndex:
-    """Reusable, bounded index for transcripts used by the live reconciler.
+    """Reusable, bounded index for transcript files touched recently.
 
     Discovery is throttled, unchanged files are not opened, and only the most
     recent files/calls are retained.  A file being appended to is reparsed on
@@ -546,13 +545,14 @@ def ingest_entry(
     if author not in AGENT_AUTHORS:
         return False
     target_ms = (timestamp_ns or 0) // 1_000_000
-    # The agent appends the result to its transcript *after* the shell hook
-    # records the command, so the file we want was written at or after
-    # ``target_ms``. Scanning only that window keeps the live path cheap.
+    # The agent appends the result to its transcript after Atuin records the
+    # command, so the file we want was written at or after ``target_ms``.
     if index is None:
-        # Direct/CLI users do not have a reconciler-owned worker. Keep a small
-        # reusable index for them too, keyed by the current HOME-derived roots.
-        index = _direct_indexes.setdefault(author, TranscriptIndex((author,)))
+        # Reuse an in-process index for direct calls, scoped to the current
+        # agent home. HOME can change between calls (tests, embedded users),
+        # and an index for the previous home would silently miss its sessions.
+        cache_key = (author, Path.home())
+        index = _direct_indexes.setdefault(cache_key, TranscriptIndex((author,)))
     index.refresh(min_timestamp_ms=target_ms)
     best = index.match(command, target_ms)
     if best is None:
